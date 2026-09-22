@@ -1,0 +1,17 @@
+[Unit]
+Description=m61-tunnel relay (ngrok-like reverse tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/m61-tunnel/relay/server.py \
+    --token CHANGE_ME_LONG_RANDOM_TOKEN \
+    --listen 0.0.0.0:7002 \
+    --ctrl-port 7000 \
+    --data-port 7001
+Restart=always
+RestartSec=3
+# 建议再锁一下防火墙：7002 对全网开放，7000/7001 只对你的常用出口 IP 开放
+
+[Install]
+WantedBy=multi-user.target

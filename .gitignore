@@ -1,0 +1,20 @@
+# 编译产物
+firmware/build/
+firmware/build_out/
+*.bin
+*.elf
+*.map
+*.asm
+
+# 烧录套件（本地生成，不入库）
+flash-kit/
+*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
