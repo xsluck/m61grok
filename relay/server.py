@@ -7,7 +7,7 @@ m61-tunnel relay v2 —— ngrok 式反向隧道中继，跑在有公网 IP 的 
   python3 server.py --token <TOKEN> --single-port 7000
 
 v2 多目标：
-  板子 HELLO 时带上映射表: HELLO <token> <id> TUNNELS 21114=192.168.1.100:8080,21116=local:80
+  板子 HELLO 时带上映射表: HELLO <token> <id> TUNNELS 21114=192.168.0.127:8080,21116=local:80
   中继为每个公网访客端口（21114...）开监听；访客连哪个端口就转发到哪个目标。
   映射表由板端管理页在线修改（保存后板子重连，中继自动更新监听端口）。
 
@@ -348,7 +348,7 @@ class Relay:
         async def pump(src, dst, stat_key):
             try:
                 while True:
-                    data = await src.read(8192)
+                    data = await asyncio.wait_for(src.read(8192), 600)  # 10min空闲断开：防死连接协程泄漏
                     if not data:
                         break
                     dst.write(data)
