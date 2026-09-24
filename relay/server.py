@@ -351,12 +351,14 @@ class Relay:
         socks_val = None
         if "SOCKS_PASS=" in extra:
             idx = extra.find("SOCKS_PASS=")
-            tail = extra[idx + 11:].split(None, 1)[0]
+            seg = extra[idx + 11:].split(None, 1)
+            tail = seg[0] if seg else ""   # 行尾空值不崩
             self.socks_pass = tail if tail else None
             extra = (extra[:idx] + " " + extra[idx + 11 + len(tail):]).strip()
         if "SOCKS=" in extra:
             idx = extra.find("SOCKS=")
-            tail = extra[idx + 6:].split(None, 1)[0]
+            seg = extra[idx + 6:].split(None, 1)
+            tail = seg[0] if seg else ""
             socks_val = tail
             extra = (extra[:idx] + " " + extra[idx + 6 + len(tail):]).strip()
         if socks_val is not None:
