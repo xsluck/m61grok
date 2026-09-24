@@ -1,6 +1,6 @@
 # m61grok
 
-**A tiny ngrok for RISC-V MCUs** — 用一块几十块的 [AI-M61-32S](https://docs.zephyrproject.org/latest/boards/aithinker/ai_m61_32s_kit/doc/index.html)（博流 BL618，RISC-V 320MHz）开发板，把家里/办公室局域网的服务发布到公网。不需要云厂商、不需要付费隧道服务，一台最便宜的 VPS 就够。
+**A tiny ngrok for RISC-V MCUs** — 用一块几十块的 [AI-M61-32S](https://docs.zephyrproject.org/latest/boards/aithinker/ai_m61_32s_kit/doc/index.html)（博流 BL618，RISC-V 320MHz）开发板，把家里/办公室局域网的服务发布到公网，还可以当**类 VPN** 用（SOCKS5 一端口访问整个内网）。不需要云厂商、不需要付费隧道服务，一台最便宜的 VPS 就够。
 
 ```
                  任何访客（手机 / 外网同事）
@@ -19,6 +19,9 @@
                         │ 局域网 TCP
                         ▼
               内网服务（HTTP/SSH/任意 TCP）
+
+  类 VPN（SOCKS5）：电脑/手机配代理指向 7000 → 内网任意 IP:端口直达
+  （复用同一端口，无需逐个加映射，详见 docs/socks5.md）
 ```
 
 ## 特性
@@ -29,7 +32,7 @@
 - **AP 配网**：连不上 WiFi 时板子自动开热点 `M61-Setup`，手机连上去浏览器打开 `192.168.1.1` 就能配网（像配智能插座一样）
 - **状态灯**：红/绿/蓝三色 LED 一眼判断板子死在哪一段
 - **断电记忆**：所有配置（WiFi、服务器、映射表、密码）存 flash，重启即恢复
-- **SOCKS5 模式（类 VPN）**：客户端配 SOCKS5 代理指向中继，直接访问板子所在内网的任意 IP:端口——无需逐个加映射，复用 7000 单端口，详见 [docs/socks5.md](docs/socks5.md)
+- **SOCKS5 模式（类 VPN，v3.0）**：电脑/手机配 SOCKS5 代理指向中继，直接访问板子所在内网的**任意 IP:端口**——无需逐个加映射、复用 7000 单端口、token 认证 + 仅私网目标防滥用，详见 [docs/socks5.md](docs/socks5.md)
 - **单端口协议**：板子出站只占 1 个端口（默认 7000），适合只放行少数端口的严格网络
 - **中继零依赖**：纯 Python 3 标准库（≥3.8），VPS 上一个文件跑起来，systemd 托管
 
@@ -116,6 +119,15 @@ make flash CHIP=bl616 BOARD=bl616dk COMX=/dev/ttyUSB0
 
 局域网内也可以直接访问 `http://<板子IP>/?pw=m61pin`（板子 IP 见串口日志或路由器）。串口敲 `info` 随时查看服务器地址、token、管理密码。
 
+### 第 6 步：类 VPN 访问整个内网（SOCKS5）
+
+```bash
+# 命令行验证（经板子访问内网任意 IP:端口）
+curl --proxy "socks5://user:<token>@<vps-ip>:7000" http://192.168.1.100:8080/
+```
+
+浏览器装 SwitchyOmega 等插件配 SOCKS5 代理（`<vps-ip>:7000`，密码=token）后，直接在地址栏访问内网任意地址——无需逐个加映射。详见 **[docs/socks5.md](docs/socks5.md)**。
+
 ## 状态灯
 
 | 灯 | 含义 |
@@ -167,6 +179,12 @@ make flash CHIP=bl616 BOARD=bl616dk COMX=/dev/ttyUSB0
 **Arduino 能开发吗？** 目前不行——官方 Arduino 核心（bouffalolab/arduino-bouffalo）尚无 WiFiClient/WiFiServer 实现，固件基于 C SDK。
 
 **访客端口怎么选？** 板子映射表里的 `vport` 就是 VPS 上对公网监听的端口，记得在云安全组放行；板子出站永远只用 7000（或你设置的单端口），不受映射表影响。
+
+## Changelog
+
+- **v3.0** — SOCKS5 类 VPN 模式（`OPENX/AUTHX` 协议、RFC1929 认证、私网白名单）；板端并发槽位 4→8；中继 pump 加空闲超时防协程泄漏
+- **v2.x** — 多目标映射表（flash 持久化）、板载 Web 管理页（映射/WiFi/服务器地址/PIN/token 热更新）、AP 配网热点（`M61-Setup`）、三色 LED 状态灯、单端口协议（7000 三合一）、lwIP 优雅关闭与 HTTP 解析健壮性修复
+- **v1.0** — 基础反向隧道（单目标、演示页、Python 中继 + PC 客户端）
 
 ## License
 
