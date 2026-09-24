@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.9"
+#define TUNNEL_FW_VERSION "v3.10"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -324,7 +324,8 @@ static void map_load(void)
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
     if (memcmp(blob.magic, "M62B", 4) == 0 &&
-        blob.count > 0 && blob.count <= CFG_MAX_TARGETS &&
+        blob.count <= CFG_MAX_TARGETS &&  /* v3.10 修复：count=0（零映射）也是合法配置，
+                                             旧的 count>0 校验会让空映射时全部配置被判无效 */
         blob.crc == blob_sum(&blob)) {
         memset(s_map, 0, sizeof(s_map));
         blob.wifi_ssid[sizeof(blob.wifi_ssid) - 1] = '\0';
