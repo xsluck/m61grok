@@ -171,7 +171,7 @@ class Relay:
         elif line.startswith("AUTH") or line.startswith("AUTHX"):
             await self._data_flow(reader, writer, line)
         else:
-            await self._default_http_flow(reader, writer, raw or b"")
+            await self._default_http_flow(reader, writer, first + (raw or b""))
 
     async def _socks5_flow(self, reader, writer):
         """SOCKS5 (RFC1928 + RFC1929 密码认证)。认证=token；仅放行私网目标。"""
