@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.7"
+#define TUNNEL_FW_VERSION "v3.8"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -273,7 +273,7 @@ void tunnel_wifi_connect(void);
 void tunnel_print_info(void);
 
 typedef struct {
-    char magic[4];                /* "M62A"（v3.7：+GPIO表；旧布局读不过会回默认一次） */
+    char magic[4];                /* "M62B"（v3.8：默认零映射；旧布局读不过会回默认一次） */
     uint16_t count;
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -311,22 +311,14 @@ static void map_defaults(void)
     s_socks_on = 0;
     s_socks_pass[0] = '\0';
     memset(s_gpios, 0, sizeof(s_gpios));
-    const tunnel_map_t def[] = { CFG_DEFAULT_MAP };
-    int n = sizeof(def) / sizeof(def[0]);
-    if (n > CFG_MAX_TARGETS) {
-        n = CFG_MAX_TARGETS;
-    }
-    for (int i = 0; i < n; i++) {
-        s_map[i] = def[i];
-        s_map[i].in_use = 1;
-    }
+    /* v3.8：默认零映射，全部由管理页配置 */
 }
 
 static void map_load(void)
 {
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
-    if (memcmp(blob.magic, "M62A", 4) == 0 &&
+    if (memcmp(blob.magic, "M62B", 4) == 0 &&
         blob.count > 0 && blob.count <= CFG_MAX_TARGETS &&
         blob.crc == blob_sum(&blob)) {
         memset(s_map, 0, sizeof(s_map));
@@ -368,7 +360,7 @@ int map_save(void)
 {
     static cfg_blob_t blob;
     memset(&blob, 0, sizeof(blob));
-    memcpy(blob.magic, "M62A", 4);
+    memcpy(blob.magic, "M62B", 4);
     strncpy(blob.wifi_ssid, s_wifi_ssid, sizeof(blob.wifi_ssid) - 1);
     strncpy(blob.wifi_pass, s_wifi_pass, sizeof(blob.wifi_pass) - 1);
     strncpy(blob.relay_host, s_relay_host, sizeof(blob.relay_host) - 1);
@@ -643,8 +635,8 @@ static void mgmt_page(int fd)
         "<input type='hidden' name='pw' value='%s'>"
         "<input name='newtoken' size='30' placeholder='新隧道token(自动双端同步)'> "
         "<button name='op' value='token'>改token</button>"
-        "<p style='color:#888'>改token会经隧道自动同步到服务器并双端持久化,"
-        "需隧道在线时操作。</p></form>"
+        "<p style='color:#888'>在线:自动双端同步;离线:确认后可强制修改"
+        "(页面会给服务器同步命令)。</p></form>"
         "<p style='color:#888'>fw %s | 中继: %s:%u | 目标数: %d | heap: %d B</p>"
         "</body></html>",
         s_pin, s_pin, s_pin,               /* add/save/wifi 表单的 pw */
@@ -967,9 +959,41 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
             return 0;
         }
         if (s_ctrl_fd < 0) {
-            const char msg[] = "<html><body><h3>隧道当前离线</h3>"
-                "<p>改 token 需要隧道在线（蓝灯灭时再试）。</p></body></html>";
-            http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+            char force[4];
+            if (form_value(body, "force", force, sizeof(force)) > 0 &&
+                strcmp(force, "1") == 0) {
+                memset(s_token, 0, sizeof(s_token));
+                strncpy(s_token, newtoken, sizeof(s_token) - 1);
+                map_save();
+                static char fmsg[768];
+                char esc_t[80];
+                html_escape(newtoken, esc_t, sizeof(esc_t));
+                int n = snprintf(fmsg, sizeof(fmsg),
+                    "<html><body><h3>OK token 已强制修改（仅板子侧）</h3>"
+                    "<p>中继还是旧 token，板子将连不上（蓝灯闪）。"
+                    "在服务器上执行以下命令完成同步：</p>"
+                    "<pre>echo %s &gt; /opt/m61-tunnel/token<br>"
+                    "systemctl restart m61-tunnel</pre></body></html>", esc_t);
+                http_respond(fd, 200, "OK", fmsg, n);
+                LOG_W("token force-changed while tunnel offline");
+                return 0;
+            }
+            static char wmsg[768];
+            char esc_w[80];
+            html_escape(newtoken, esc_w, sizeof(esc_w));
+            int n = snprintf(wmsg, sizeof(wmsg),
+                "<html><body><h3>隧道当前离线</h3>"
+                "<p>在线时会自动双端同步；离线强制修改的后果：</p>"
+                "<ul><li>板子立即用新 token，中继仍是旧值</li>"
+                "<li>重连会失败（蓝灯常闪）直到中继侧同步</li></ul>"
+                "<form method='POST' action='/op'>"
+                "<input type='hidden' name='pw' value='%s'>"
+                "<input type='hidden' name='newtoken' value='%s'>"
+                "<input type='hidden' name='force' value='1'>"
+                "<button name='op' value='token'>我已了解, 强制修改</button></form>"
+                "<p><a href='/?pw=%s'>返回, 等在线再改</a></p></body></html>",
+                s_pin, esc_w, s_pin);
+            http_respond(fd, 200, "OK", wmsg, n);
             return 0;
         }
         if (tok_len > 5 && strlen(newtoken) < sizeof(s_token)) {
