@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v4.0-hw1"
+#define TUNNEL_FW_VERSION "v4.1-hw1"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -215,6 +215,30 @@ typedef struct {
 static gpio_entry_t s_gpios[CFG_MAX_GPIOS];
 
 static uint8_t s_led_manual = 0; /* 1=手动灯效：状态灯任务停刷，12/14/15 解锁给用户 */
+
+/* 手动模式下的软 PWM 亮度（红绿蓝各 0-10 级，0=灭 10=全亮；100Hz 软件调光） */
+static volatile uint8_t s_rgb_lvl[3] = {0, 0, 0};
+
+static void soft_pwm_task(void *arg)
+{
+    (void)arg;
+    struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
+    const uint8_t pins[3] = {LED_R, LED_G, LED_B};
+    int step = 0;
+    for (;;) {
+        if (s_led_manual) {
+            for (int c = 0; c < 3; c++) {
+                if (s_rgb_lvl[c] > step) {
+                    bflb_gpio_set(gpio, pins[c]);
+                } else {
+                    bflb_gpio_reset(gpio, pins[c]);
+                }
+            }
+            step = (step + 1) % 10;
+        }
+        vTaskDelay(1); /* 1ms 步进 → 100Hz/10级 */
+    }
+}
 
 /* PWM 通道（管理页增删，flash 持久化）
  * BL616: PWM0 通道 0-5 对应 GPIO 24/25/26/27/28/29 */
@@ -739,7 +763,13 @@ static void mgmt_page(int fd)
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
         "<button name='op' value='ledmode'>灯效模式切换(状态灯⇄手动)</button></form>"
-        "(手动模式解锁红绿蓝三脚可自由点灯/混色,重启回状态模式)"
+        "(手动模式解锁红绿蓝三脚,支持调光: /led?pw=&r=&g=&b= 各0-10)"
+        "<form method='POST' action='/op'>"
+        "<input type='hidden' name='pw' value='%s'>"
+        "R<input name='r' size='2' value='%d'> "
+        "G<input name='g' size='2' value='%d'> "
+        "B<input name='b' size='2' value='%d'> "
+        "<button name='op' value='rgb'>设RGB亮度</button></form>"
         "<hr/><h3>SOCKS5</h3>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -772,6 +802,8 @@ static void mgmt_page(int fd)
         s_pin,                             /* pwm 添加表单 pw */
         pwm_rows,                          /* pwm 表格行 */
         s_pin,                             /* 灯效切换按钮 pw */
+        s_pin,                             /* rgb 表单 pw */
+        (int)s_rgb_lvl[0], (int)s_rgb_lvl[1], (int)s_rgb_lvl[2], /* 当前亮度 */
         s_pin, socks_op, socks_label,       /* socks 开关表单 */
         s_pin,                              /* socks 密码表单 pw */
         s_socks_pass[0] ? s_socks_pass : "(未设置)", /* 当前密码提示 */
@@ -860,6 +892,27 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strncmp(path, "/led", 4) == 0) {
+        char vr[6], vg[6], vb[6];
+        if (!s_led_manual) {
+            http_respond(fd, 400, "Bad Request", "enable manual led mode first", 29);
+            return 0;
+        }
+        if (form_value(req_head, "r", vr, sizeof(vr)) > 0) {
+            s_rgb_lvl[0] = (uint8_t)(atoi(vr) > 10 ? 10 : atoi(vr));
+        }
+        if (form_value(req_head, "g", vg, sizeof(vg)) > 0) {
+            s_rgb_lvl[1] = (uint8_t)(atoi(vg) > 10 ? 10 : atoi(vg));
+        }
+        if (form_value(req_head, "b", vb, sizeof(vb)) > 0) {
+            s_rgb_lvl[2] = (uint8_t)(atoi(vb) > 10 ? 10 : atoi(vb));
+        }
+        static char buf[24];
+        int n = snprintf(buf, sizeof(buf), "%d,%d,%d",
+                         s_rgb_lvl[0], s_rgb_lvl[1], s_rgb_lvl[2]);
+        http_respond(fd, 200, "OK", buf, n);
+        return 0;
+    }
     if (strncmp(path, "/adc", 4) == 0) {
         static char mv[16];
         int n = snprintf(mv, sizeof(mv), "%d", adc_read_mv());
@@ -1023,6 +1076,26 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strcmp(op, "rgb") == 0) {
+        char vr[6], vg[6], vb[6];
+        int r = form_value(body, "r", vr, sizeof(vr)) > 0 ? atoi(vr) : -1;
+        int g = form_value(body, "g", vg, sizeof(vg)) > 0 ? atoi(vg) : -1;
+        int b = form_value(body, "b", vb, sizeof(vb)) > 0 ? atoi(vb) : -1;
+        if (!s_led_manual) {
+            const char msg[] = "<html><body><h3>请先切到手动灯效</h3></body></html>";
+            http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+            return 0;
+        }
+        if (r < 0 || r > 10 || g < 0 || g > 10 || b < 0 || b > 10) {
+            http_respond(fd, 400, "Bad Request", "levels 0-10", 12);
+            return 0;
+        }
+        s_rgb_lvl[0] = (uint8_t)r;
+        s_rgb_lvl[1] = (uint8_t)g;
+        s_rgb_lvl[2] = (uint8_t)b;
+        mgmt_page(fd);
+        return 0;
+    }
     if (strcmp(op, "ledmode") == 0) {
         s_led_manual ^= 1;
         if (!s_led_manual) {
@@ -1035,9 +1108,16 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
             }
             map_save();
         }
+        if (s_led_manual) {
+            struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
+            bflb_gpio_init(gpio, LED_R, GPIO_OUTPUT | GPIO_SMT_EN | GPIO_DRV_0);
+            bflb_gpio_init(gpio, LED_G, GPIO_OUTPUT | GPIO_SMT_EN | GPIO_DRV_0);
+            bflb_gpio_init(gpio, LED_B, GPIO_OUTPUT | GPIO_SMT_EN | GPIO_DRV_0);
+            s_rgb_lvl[0] = s_rgb_lvl[1] = s_rgb_lvl[2] = 0;
+        }
         const char msg_on[] = "<html><body><h3>已切到手动灯效</h3>"
-            "<p>状态灯任务已停止，红(12)绿(14)蓝(15)三脚解锁——"
-            "现在去 GPIO 区添加它们，用按钮或 /gpio 接口随意点灯混色。</p></body></html>";
+            "<p>红绿蓝支持调光：<code>/led?pw=xxx&r=10&g=0&b=5</code>"
+            "（各 0-10 级），或页面下方 RGB 控制。</p></body></html>";
         const char msg_off[] = "<html><body><h3>已切回状态灯模式</h3>"
             "<p>红绿蓝恢复为状态指示（对这三个脚的 GPIO 配置已自动清除）。</p></body></html>";
         if (s_led_manual) {
@@ -1393,7 +1473,7 @@ static void led_task(void *arg)
     int phase = 0;
     for (;;) {
         if (s_led_manual) {
-            vTaskDelay(500 / portTICK_PERIOD_MS); /* 手动灯效：不碰引脚 */
+            vTaskDelay(500 / portTICK_PERIOD_MS); /* 手动灯效：引脚交给软PWM */
             continue;
         }
         int r_on = 0, g_on = 0, b_on = 0;
@@ -1805,6 +1885,7 @@ void tunnel_init(void)
     s_mgmt_lock = xSemaphoreCreateMutex();
     xTaskCreate(ap_watchdog_task, "apwd", 512, NULL, 10, NULL);
     xTaskCreate(led_task, "led", 512, NULL, 9, NULL);
+    xTaskCreate(soft_pwm_task, "spwm", 512, NULL, 8, NULL);
     /* 管理页开机即启动（监听所有接口）——不能等连上 WiFi 才起：
      * AP 配网模式恰恰是连不上 WiFi 的场景，管理页必须先于网络可用 */
     xTaskCreate(mgmt_server_task, "mgmt", 1024, NULL, 11, NULL);
