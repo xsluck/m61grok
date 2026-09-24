@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.3"
+#define TUNNEL_FW_VERSION "v3.4"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -213,6 +213,12 @@ static uint16_t s_relay_port;
 /* token 与管理页 PIN 也可管理页修改（存 flash；改 token 需同步服务器侧） */
 static char s_token[65];
 static char s_pin[24];
+
+/* token 在线同步请求（管理页 → tunnel_task 控制循环执行）
+ * 0=空闲 1=进行中 2=成功 3=失败 */
+static volatile int s_token_req = 0;
+static char s_token_new[65];
+static int s_ctrl_fd = -1; /* 前向声明：mgmt 检查隧道是否在线 */
 
 /* SOCKS5 开关（管理页控制，经 HELLO 下发给中继；默认关，手动开启）
  * 独立密码（可与管理页 PIN/token 不同；开启前必须设置） */
@@ -553,10 +559,10 @@ static void mgmt_page(int fd)
         "<button name='op' value='pin'>改管理密码</button></form>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
-        "<input name='newtoken' size='30' placeholder='新隧道token(改后需同步服务器!)'> "
+        "<input name='newtoken' size='30' placeholder='新隧道token(自动双端同步)'> "
         "<button name='op' value='token'>改token</button>"
-        "<p style='color:#c00'>警告: 改token后必须同步修改服务器并重启中继,"
-        "否则隧道断开(蓝灯闪), 需用局域网管理页改回!</p></form>"
+        "<p style='color:#888'>改token会经隧道自动同步到服务器并双端持久化,"
+        "需隧道在线时操作。</p></form>"
         "<p style='color:#888'>fw %s | 中继: %s:%u | 目标数: %d | heap: %d B</p>"
         "</body></html>",
         s_pin, s_pin, s_pin,               /* add/save/wifi 表单的 pw */
@@ -800,18 +806,31 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
     if (strcmp(op, "token") == 0) {
         char newtoken[65];
         if (form_value(body, "newtoken", newtoken, sizeof(newtoken)) > 7 &&
-            strlen(newtoken) < sizeof(s_token)) {
-            memset(s_token, 0, sizeof(s_token));
-            strncpy(s_token, newtoken, sizeof(s_token) - 1);
-            map_save();
-            const char msg[] = "<html><body><h3>OK token 已改，正在用新 token 重连</h3>"
-                "<p><b>现在必须同步修改服务器中继的 token 并重启它</b>，"
-                "否则蓝灯常闪（连不上服务器）。改错可用局域网管理页改回。</p></body></html>";
-            http_respond(fd, 200, "OK", msg, sizeof(msg) - 1);
-            tunnel_apply_now();
+            strlen(newtoken) < sizeof(s_token) && s_ctrl_fd >= 0) {
+            memset(s_token_new, 0, sizeof(s_token_new));
+            strncpy(s_token_new, newtoken, sizeof(s_token_new) - 1);
+            s_token_req = 1;
+            /* 等 tunnel_task 在控制通道上完成同步（最多5秒） */
+            for (int i = 0; i < 50 && s_token_req == 1; i++) {
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+            if (s_token_req == 2) {
+                const char msg[] = "<html><body><h3>OK token 已双端同步更新</h3>"
+                    "<p>板子与服务器都已是新 token 并已持久化，隧道未中断。</p></body></html>";
+                http_respond(fd, 200, "OK", msg, sizeof(msg) - 1);
+            } else if (s_token_req == 3) {
+                s_token_req = 0;
+                const char msg[] = "<html><body><h3>服务器拒绝了新 token</h3>"
+                    "<p>要求：至少8位且不含空格。两边都保持旧值。</p></body></html>";
+                http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+            } else {
+                const char msg[] = "<html><body><h3>同步超时（结果未知）</h3>"
+                    "<p>若30秒内蓝灯常闪，用局域网管理页把 token 改回旧值。</p></body></html>";
+                http_respond(fd, 504, "Timeout", msg, sizeof(msg) - 1);
+            }
             return 0;
         }
-        http_respond(fd, 400, "Bad Request", "token too short (min 8)", 24);
+        http_respond(fd, 400, "Bad Request", "token invalid or tunnel offline", 32);
         return 0;
     }
 
@@ -1198,7 +1217,6 @@ static void handle_open(int map_idx, uint32_t cid, const char *dyn_host, uint16_
 /* 控制通道                                                            */
 /* ------------------------------------------------------------------ */
 
-static int s_ctrl_fd = -1;
 static volatile int s_apply_request = 0;
 
 void tunnel_apply_now(void)
@@ -1259,8 +1277,23 @@ static void tunnel_task(void *arg)
                 LOG_W("relay not answering PING, reconnect");
                 break;
             }
+            if (s_token_req == 1 && s_ctrl_fd >= 0) {
+                snprintf(line, sizeof(line), "SETTOKEN %s\n", s_token_new);
+                if (send_str(s_ctrl_fd, line) != 0) {
+                    s_token_req = 3; /* 发送失败 */
+                }
+            }
             if (recv_line(s_ctrl_fd, line, sizeof(line), 500) > 0) {
-                if (strcmp(line, "PONG") == 0) {
+                if (s_token_req == 1 && strncmp(line, "OK", 2) == 0) {
+                    memset(s_token, 0, sizeof(s_token));
+                    strncpy(s_token, s_token_new, sizeof(s_token) - 1);
+                    map_save();
+                    s_token_req = 2;
+                    LOG_I("token updated both sides (persisted)");
+                } else if (s_token_req == 1 && strncmp(line, "ERR", 3) == 0) {
+                    s_token_req = 3;
+                    LOG_W("SETTOKEN rejected: %s", line);
+                } else if (strcmp(line, "PONG") == 0) {
                     last_pong = now_ms();
                 } else if (strncmp(line, "OPENX ", 6) == 0) {
                     /* v3 SOCKS5: OPENX <cid> <host> <port> */

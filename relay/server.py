@@ -399,6 +399,29 @@ class Relay:
                 if line == "PING":
                     writer.write(b"PONG\n")
                     await writer.drain()
+                elif line.startswith("SETTOKEN "):
+                    new_tok = line[9:].strip()
+                    if len(new_tok) >= 8 and " " not in new_tok:
+                        old_tok = self.token
+                        self.token = new_tok
+                        ok = True
+                        try:  # 持久化：重启后仍是新 token（板子是真相源）
+                            import os
+                            tf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token")
+                            with open(tf, "w") as f:
+                                f.write(new_tok)
+                            os.chmod(tf, 0o600)
+                        except Exception as e:
+                            log.warning("SETTOKEN: persist failed: %s", e)
+                            ok = False
+                            self.token = old_tok  # 写盘失败则回滚，双端一致
+                        writer.write(b"OK\n" if ok else b"ERR persist failed\n")
+                        await writer.drain()
+                        if ok:
+                            log.info("token updated by board (persisted)")
+                    else:
+                        writer.write(b"ERR bad token (min 8, no spaces)\n")
+                        await writer.drain()
                 elif line:
                     log.debug("control msg ignored: %r", line[:80])
         except Exception as e:
@@ -589,6 +612,13 @@ async def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     token = args.token or secrets.token_hex(16)
+    import os
+    _tf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token")
+    if os.path.exists(_tf):
+        _saved = open(_tf).read().strip()
+        if _saved and _saved != token:
+            log.info("using persisted token from %s (board-updated)", _tf)
+            token = _saved
 
     host, _, port = args.listen.rpartition(":")
     host = host or "0.0.0.0"
