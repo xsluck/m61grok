@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v4.2-hw1"
+#define TUNNEL_FW_VERSION "v4.3"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -29,9 +29,6 @@
 
 /* 板载 LED（Zephyr 板级定义，高电平亮）：红=12 绿=14 蓝=15 */
 #include "bflb_gpio.h"
-#include "bflb_pwm_v2.h"
-#include "bflb_clock.h"  /* BFLB_SYSTEM_XCLK */
-#include "bflb_adc.h"
 #define LED_R GPIO_PIN_12
 #define LED_G GPIO_PIN_14
 #define LED_B GPIO_PIN_15
@@ -55,6 +52,11 @@
 
 #include "tunnel.h"
 #include "tunnel_config.h"
+#if CFG_HW_MODULE
+#include "bflb_pwm_v2.h"
+#include "bflb_clock.h"  /* BFLB_SYSTEM_XCLK */
+#include "bflb_adc.h"
+#endif
 
 /* ------------------------------------------------------------------ */
 /* 工具                                                                */
@@ -205,7 +207,7 @@ typedef struct {
 
 static tunnel_map_t s_map[CFG_MAX_TARGETS];
 
-/* GPIO 配置（管理页增删，flash 持久化；12/14/15 是状态灯不可用） */
+/* 硬件配置类型（放公共区：cfg_blob_t 布局要求两种构建一致） */
 typedef struct {
     uint8_t pin;
     uint8_t is_output;
@@ -214,8 +216,9 @@ typedef struct {
 } gpio_entry_t;
 static gpio_entry_t s_gpios[CFG_MAX_GPIOS];
 
-static uint8_t s_led_manual = 0; /* 1=手动灯效：状态灯任务停刷，12/14/15 解锁给用户 */
+static uint8_t s_led_manual = 0; /* 1=手动灯效（仅硬件版有效；纯透传版恒0） */
 
+#if CFG_HW_MODULE
 /* 手动模式下的软 PWM 亮度（红绿蓝各 0-10 级，0=灭 10=全亮；100Hz 软件调光） */
 static volatile uint8_t s_rgb_lvl[3] = {0, 0, 0};
 
@@ -239,6 +242,7 @@ static void soft_pwm_task(void *arg)
         vTaskDelay(1); /* 1ms 步进 → 100Hz/10级 */
     }
 }
+#endif /* hw: soft pwm */
 
 /* PWM 通道（管理页增删，flash 持久化）
  * BL616: PWM0 通道 0-5 对应 GPIO 24/25/26/27/28/29 */
@@ -250,6 +254,9 @@ typedef struct {
     uint16_t duty;    /* 0-1000 千分比 */
     uint8_t in_use;
 } pwm_entry_t;
+
+#if CFG_HW_MODULE
+/* ---------- 硬件模块（构建时启用） ---------- */
 static pwm_entry_t s_pwms[CFG_MAX_PWMS];
 
 static int pwm_ch_from_pin(uint8_t pin)
@@ -314,6 +321,7 @@ static void gpio_apply_all(void)
         }
     }
 }
+#endif /* hw: gpio+pwm data */
 
 /* WiFi 凭据也存 flash（管理页可改，换 WiFi 不用重烧固件） */
 static char s_wifi_ssid[33];
@@ -341,6 +349,7 @@ static char s_socks_pass[33];
 /* 管理页 HTTP 处理串行锁：static 缓冲不允许并发（多访客同时打开会互相踩） */
 static SemaphoreHandle_t s_mgmt_lock;
 
+#if CFG_HW_MODULE
 /* ADC：模拟量读取（默认引脚 CFG_ADC_PIN=GPIO20/通道0；返回 mV） */
 static int adc_read_mv(void)
 {
@@ -372,6 +381,7 @@ static int adc_read_mv(void)
     return result.millivolt;
 }
 
+#endif /* hw: adc */
 /* 前向声明（map_load 首次会写默认表进 flash；mgmt 保存后触发重连） */
 int map_save(void);
 void tunnel_apply_now(void);
@@ -448,12 +458,14 @@ static void map_load(void)
         s_socks_on = blob.socks_on ? 1 : 0;
         blob.socks_pass[sizeof(blob.socks_pass) - 1] = '\0';
         strncpy(s_socks_pass, blob.socks_pass, sizeof(s_socks_pass) - 1);
+#if CFG_HW_MODULE
         for (int i = 0; i < CFG_MAX_GPIOS; i++) {
             s_gpios[i] = blob.gpios[i];
         }
         for (int i = 0; i < CFG_MAX_PWMS; i++) {
             s_pwms[i] = blob.pwms[i];
         }
+#endif
         for (int i = 0; i < blob.count && i < CFG_MAX_TARGETS; i++) {
             blob.entries[i].target_host[sizeof(blob.entries[i].target_host) - 1] = '\0';
             s_map[i] = blob.entries[i];
@@ -663,6 +675,7 @@ static void mgmt_page(int fd)
                           i, (unsigned)s_map[i].visitor_port, esc,
                           (unsigned)s_map[i].target_port, i);
     }
+#if CFG_HW_MODULE
     /* GPIO 行：独立拼接（输出脚显示当前电平并可切换；输入脚实时读） */
     static char gpio_rows[1600];
     struct bflb_device_s *gpio_dev = bflb_device_get_by_name("gpio");
@@ -712,6 +725,7 @@ static void mgmt_page(int fd)
             s_pin, i, (int)s_pwms[i].duty);
     }
 
+#endif /* hw: rows */
     const char *socks_op = s_socks_on ? "socks_off" : "socks_on";
     const char *socks_label = s_socks_on ? "SOCKS5: ON (click to disable)"
                                          : "SOCKS5: OFF (click to enable)";
@@ -738,6 +752,7 @@ static void mgmt_page(int fd)
         "<input name='rhost' size='18' placeholder='服务器IP' value='%s'> "
         "<input name='rport' size='6' placeholder='端口' value='%u'> "
         "<button name='op' value='relay'>切换到这个服务器</button></form>"
+        #if CFG_HW_MODULE
         "<hr/><h3>GPIO</h3><table><tr><th>pin</th><th>dir</th><th>level</th><th>op</th></tr>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -770,6 +785,8 @@ static void mgmt_page(int fd)
         "G<input name='g' size='2' value='%d'> "
         "B<input name='b' size='2' value='%d'> "
         "<button name='op' value='rgb'>设RGB亮度</button></form>"
+        
+#endif /* hw: page blocks */
         "<hr/><h3>SOCKS5</h3>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -796,6 +813,7 @@ static void mgmt_page(int fd)
         s_wifi_ssid,                        /* wifi ssid 输入框值 */
         s_pin,                              /* relay 表单的 pw */
         s_relay_host, (unsigned)s_relay_port, /* relay 表单 host/port 值 */
+#if CFG_HW_MODULE
         s_pin,                             /* gpio 添加表单 pw */
         gpio_rows,                         /* gpio 表格行 */
         adc_read_mv(), CFG_ADC_PIN,        /* ADC 实时读数 */
@@ -804,6 +822,7 @@ static void mgmt_page(int fd)
         s_pin,                             /* 灯效切换按钮 pw */
         s_pin,                             /* rgb 表单 pw */
         (int)s_rgb_lvl[0], (int)s_rgb_lvl[1], (int)s_rgb_lvl[2], /* 当前亮度 */
+#endif
         s_pin, socks_op, socks_label,       /* socks 开关表单 */
         s_pin,                              /* socks 密码表单 pw */
         s_socks_pass[0] ? s_socks_pass : "(未设置)", /* 当前密码提示 */
@@ -896,6 +915,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+#if CFG_HW_MODULE
     if (strncmp(path, "/led", 4) == 0) {
         char vr[6], vg[6], vb[6];
         if (!s_led_manual) {
@@ -954,6 +974,11 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         http_respond(fd, 400, "Bad Request", "need pin", 8);
         return 0;
     }
+
+    http_respond(fd, 404, "Not Found", "hw module disabled", 18);
+    return 0;
+#endif /* hw: apis */
+#if CFG_HW_MODULE
     if (strncmp(path, "/gpio", 5) == 0) {
         /* 脚本接口：GET /gpio?pw=x&pin=12&set=1  /  &get=1 → 文本返回 0/1 */
         char vpin[8], vset[4], vget[4];
@@ -981,6 +1006,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         http_respond(fd, 400, "Bad Request", "need pin", 8);
         return 0;
     }
+#endif /* hw: gpio api */
     if (strcmp(method, "GET") == 0) {
         mgmt_page(fd);
         return 0;
@@ -1080,6 +1106,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+#if CFG_HW_MODULE
     if (strcmp(op, "rgb") == 0) {
         char vr[6], vg[6], vb[6];
         int r = form_value(body, "r", vr, sizeof(vr)) > 0 ? atoi(vr) : -1;
@@ -1227,6 +1254,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         mgmt_page(fd);
         return 0;
     }
+#endif /* hw: ops */
     if (strcmp(op, "socks_on") == 0 || strcmp(op, "socks_off") == 0) {
         if (strcmp(op, "socks_on") == 0 && s_socks_pass[0] == '\0') {
             const char msg[] = "<html><body><h3>请先设置SOCKS5密码</h3>"
@@ -1879,17 +1907,21 @@ void tunnel_init(void)
     }
     inited = 1;
     map_load();
+#if CFG_HW_MODULE
     gpio_apply_all();
     for (int i = 0; i < CFG_MAX_PWMS; i++) {
         if (s_pwms[i].in_use) {
             pwm_apply(&s_pwms[i]);
         }
     }
+#endif
     tunnel_print_info(); /* 开机自报家门 */
     s_mgmt_lock = xSemaphoreCreateMutex();
     xTaskCreate(ap_watchdog_task, "apwd", 512, NULL, 10, NULL);
     xTaskCreate(led_task, "led", 512, NULL, 9, NULL);
+#if CFG_HW_MODULE
     xTaskCreate(soft_pwm_task, "spwm", 512, NULL, 8, NULL);
+#endif
     /* 管理页开机即启动（监听所有接口）——不能等连上 WiFi 才起：
      * AP 配网模式恰恰是连不上 WiFi 的场景，管理页必须先于网络可用 */
     xTaskCreate(mgmt_server_task, "mgmt", 1024, NULL, 11, NULL);
