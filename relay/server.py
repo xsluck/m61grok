@@ -168,12 +168,10 @@ class Relay:
             return
         if line.startswith("HELLO"):
             await self._control_flow(reader, writer, line)
-        elif line.startswith("AUTH"):
-            await self._data_flow(reader, writer, line)
-        elif line.startswith("AUTHX"):
+        elif line.startswith("AUTH") or line.startswith("AUTHX"):
             await self._data_flow(reader, writer, line)
         else:
-            await self._status_flow(writer)
+            await self._default_http_flow(reader, writer, raw or b"")
 
     async def _socks5_flow(self, reader, writer):
         """SOCKS5 (RFC1928 + RFC1929 密码认证)。认证=token；仅放行私网目标。"""
@@ -283,16 +281,28 @@ class Relay:
         finally:
             self._close_writer(writer)
 
-    async def _status_flow(self, writer):
-        """7000 端口收到非协议流量（v2 模式下访客请走映射端口）。"""
-        body = ("m61-tunnel relay v2 online=%s\n"
+    async def _default_http_flow(self, reader, writer, prefix: bytes):
+        """7000 端口收到普通 HTTP 请求：
+        板子在线且映射表有 local 条目 → 转发到板载管理页（默认绑定）；
+        否则返回中继状态页（兼做诊断）。"""
+        local_tid = None
+        for tid, t in self.tunnels.items():
+            if t["target"].split(":")[0] == "local":
+                local_tid = tid
+                break
+        if self.ctrl_writer is not None and local_tid is not None:
+            await self._visitor_flow(reader, writer, prefix, local_tid)
+            return
+        body = ("m61-tunnel relay online=%s\n"
                 "visitor ports: %s\n"
-                "tunnel/control port: %d\n" %
+                "port %d: control/data/socks5%s\n" %
                 (self.ctrl_writer is not None,
                  ", ".join(str(t["vport"]) + "->" + t["target"]
                            for t in sorted(self.tunnels.values(),
                                            key=lambda x: x["vport"])) or "(none)",
-                 self.public_port)).encode()
+                 self.public_port,
+                 " + mgmt-page" if local_tid is not None else
+                 " (add a 'local' map entry to bind board page here)")).encode()
         head = ("HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
                 "Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body)).encode()
         try:

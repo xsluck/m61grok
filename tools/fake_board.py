@@ -132,6 +132,8 @@ class FakeBoard:
                 thost, tport = dyn_host, dyn_port
             elif tid < len(self.tunnels):
                 _, thost, tport = self.tunnels[tid]
+            if thost == "local":
+                thost = None  # local = 板载管理页 → 走内置演示页
             if thost:
                 tr, tw = await asyncio.open_connection(thost, tport)
             else:
