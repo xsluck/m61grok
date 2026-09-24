@@ -175,6 +175,66 @@ class Relay:
         else:
             await self._default_http_flow(reader, writer, first + (raw or b""))
 
+    async def _dynamic_forward(self, reader, writer, host, port,
+                               prefix=b"", socks_reply=False):
+        """让板子连任意目标（OPENX/AUTHX 动态通道）并双向转发。
+        返回 True=转发已完成后关闭，False=建立失败（调用方自行善后）。"""
+        cid = self.next_cid + 1000000
+        self.next_cid += 1
+        fut = asyncio.get_event_loop().create_future()
+        self.pending[(-1, cid)] = fut
+        try:
+            self.ctrl_writer.write(("OPENX %d %s %d\n" % (cid, host, port)).encode())
+            await self.ctrl_writer.drain()
+        except Exception as e:
+            log.exception("dyn forward send failed: %s", e)
+            self.pending.pop((-1, cid), None)
+            self._drop_control()
+            return False
+        try:
+            br, bw = await asyncio.wait_for(fut, 15)
+        except Exception:
+            self.pending.pop((-1, cid), None)
+            return False
+
+        if socks_reply:
+            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+        self.stats["tunnel_ok"] += 1
+        log.info("dyn %s:%s cid=%d%s", host, port, cid,
+                 " (socks)" if socks_reply else " (default http)")
+
+        async def pump(src, dst, stat_key):
+            try:
+                while True:
+                    data = await asyncio.wait_for(src.read(8192), 600)
+                    if not data:
+                        break
+                    dst.write(data)
+                    self.stats[stat_key] += len(data)
+                    await dst.drain()
+            except Exception:
+                pass
+            finally:
+                self._try_write_eof(dst)
+
+        if prefix:
+            try:
+                bw.write(prefix)
+                self.stats["bytes_visitor_to_board"] += len(prefix)
+                await bw.drain()
+            except Exception:
+                self._close_writer(writer)
+                self._close_writer(bw)
+                return True
+        await asyncio.gather(
+            pump(br, writer, "bytes_board_to_visitor"),
+            pump(reader, bw, "bytes_visitor_to_board"),
+        )
+        self._close_writer(writer)
+        self._close_writer(bw)
+        return True
+
     async def _socks5_flow(self, reader, writer):
         """SOCKS5 (RFC1928 + RFC1929 密码认证)。认证=token；仅放行私网目标。"""
         peer = writer.get_extra_info("peername")
@@ -246,46 +306,11 @@ class Relay:
                 self._close_writer(writer)
                 return
 
-            cid = self.next_cid + 1000000  # 动态连接独立编号空间
-            fut = asyncio.get_event_loop().create_future()
-            self.pending[(-1, cid)] = fut
-            self.ctrl_writer.write(("OPENX %d %s %d\n" % (cid, host, port)).encode())
-            await self.ctrl_writer.drain()
-            try:
-                br, bw = await asyncio.wait_for(fut, 15)
-            except Exception:
-                self.pending.pop((-1, cid), None)
+            ok = await self._dynamic_forward(reader, writer, host, port,
+                                             socks_reply=True)
+            if not ok:
                 writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 await writer.drain()
-                self._close_writer(writer)
-                return
-
-            # 成功
-            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            self.stats["tunnel_ok"] += 1
-            log.info("socks5 %s -> %s:%d", peer, host, port)
-
-            async def pump(src, dst, stat_key):
-                try:
-                    while True:
-                        data = await asyncio.wait_for(src.read(8192), 600)
-                        if not data:
-                            break
-                        dst.write(data)
-                        self.stats[stat_key] += len(data)
-                        await dst.drain()
-                except Exception:
-                    pass
-                finally:
-                    self._try_write_eof(dst)
-
-            await asyncio.gather(
-                pump(br, writer, "bytes_board_to_visitor"),
-                pump(reader, bw, "bytes_visitor_to_board"),
-            )
-            self._close_writer(writer)
-            self._close_writer(bw)
         except (asyncio.IncompleteReadError, asyncio.TimeoutError):
             pass
         except Exception as e:
@@ -302,20 +327,21 @@ class Relay:
             if t["target"].split(":")[0] == "local":
                 local_tid = tid
                 break
-        if self.ctrl_writer is not None and local_tid is not None:
-            await self._visitor_flow(reader, writer, prefix, local_tid)
-            return
+        if self.ctrl_writer is not None:
+            # 默认绑定：动态转发到板载管理页，不依赖映射表条目
+            ok = await self._dynamic_forward(reader, writer, "local", 80, prefix)
+            if ok:
+                return
+            body = b"board unreachable\n"
         body = ("m61-tunnel relay online=%s\n"
                 "visitor ports: %s\n"
-                "port %d: control/data%s + mgmt-page%s\n" %
+                "port %d: control/data%s + mgmt-page(default)\n" %
                 (self.ctrl_writer is not None,
-                 "/socks5(on)" if self.socks_enabled else "/socks5(off)",
                  ", ".join(str(t["vport"]) + "->" + t["target"]
                            for t in sorted(self.tunnels.values(),
                                            key=lambda x: x["vport"])) or "(none)",
                  self.public_port,
-                 "" if local_tid is not None else
-                 " (no local map)")).encode()
+                 "/socks5(on)" if self.socks_enabled else "/socks5(off)")).encode()
         head = ("HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
                 "Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body)).encode()
         try:

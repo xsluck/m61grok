@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.5"
+#define TUNNEL_FW_VERSION "v3.6"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -1110,7 +1110,10 @@ static void tunnel_data_task(void *arg)
         }
 
         int is_local = (m && strcmp(m->target_host, "local") == 0);
-        if (s->map_idx < 0) { /* SOCKS5 动态目标 */
+        if (s->map_idx < 0 && strcmp(s->dyn_host, "local") == 0) {
+            is_local = 1; /* 动态目标 local = 板载管理页（7000 默认转发） */
+        }
+        if (s->map_idx < 0 && !is_local) { /* SOCKS5 动态目标 */
             s->local_fd = tcp_connect_host(s->dyn_host, s->dyn_port);
             if (s->local_fd < 0) {
                 LOG_W("cid %lu socks target %s:%u unreachable",
