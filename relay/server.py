@@ -48,6 +48,7 @@ class Relay:
         self.pending = {}                # (tid, cid) -> Future[(reader, writer)]
         self.next_cid = 1
         self.tunnels = {}                # tid -> {"vport": int, "target": str, "server": asyncio.Server}
+        self.socks_enabled = True        # 板子经 HELLO ... SOCKS=0/1 控制，管理页开关
         self.board_last_seen = 0.0
         self.stats = {"visitor_total": 0, "tunnel_ok": 0, "tunnel_fail": 0,
                       "bytes_board_to_visitor": 0, "bytes_visitor_to_board": 0,
@@ -176,6 +177,15 @@ class Relay:
     async def _socks5_flow(self, reader, writer):
         """SOCKS5 (RFC1928 + RFC1929 密码认证)。认证=token；仅放行私网目标。"""
         peer = writer.get_extra_info("peername")
+        if not self.socks_enabled:
+            try:
+                writer.write(b"\x05\xff")  # 无可用认证方式 = 服务拒绝
+                await writer.drain()
+            except Exception:
+                pass
+            self._close_writer(writer)
+            log.info("socks5 %s: disabled by board config", peer)
+            return
         try:
             # 握手（首字节 0x05 已由 handle_client 消费，这里从 NMETHODS 开始）
             nmethods = (await asyncio.wait_for(reader.readexactly(1), 10))[0]
@@ -295,14 +305,15 @@ class Relay:
             return
         body = ("m61-tunnel relay online=%s\n"
                 "visitor ports: %s\n"
-                "port %d: control/data/socks5%s\n" %
+                "port %d: control/data%s + mgmt-page%s\n" %
                 (self.ctrl_writer is not None,
+                 "/socks5(on)" if self.socks_enabled else "/socks5(off)",
                  ", ".join(str(t["vport"]) + "->" + t["target"]
                            for t in sorted(self.tunnels.values(),
                                            key=lambda x: x["vport"])) or "(none)",
                  self.public_port,
-                 " + mgmt-page" if local_tid is not None else
-                 " (add a 'local' map entry to bind board page here)")).encode()
+                 "" if local_tid is not None else
+                 " (no local map)")).encode()
         head = ("HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
                 "Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body)).encode()
         try:
@@ -333,11 +344,17 @@ class Relay:
             log.warning("control %s: bad handshake: %r", peer, line[:80])
             return
         tunnel_id = parts[2][:64]
-        spec = parts[3] if len(parts) > 3 else ""
-        if spec.startswith("TUNNELS "):
-            spec = spec[8:].strip()
-        else:
-            spec = ""
+        extra = parts[3] if len(parts) > 3 else ""
+        # SOCKS=n 字段独立摘取（可出现在 TUNNELS 段内/后，或独立存在）
+        socks_val = None
+        if "SOCKS=" in extra:
+            idx = extra.find("SOCKS=")
+            tail = extra[idx + 6:].split(None, 1)[0]
+            socks_val = tail
+            extra = (extra[:idx] + " " + extra[idx + 6 + len(tail):]).strip()
+        if socks_val is not None:
+            self.socks_enabled = socks_val in ("1", "true")
+        spec = extra[8:].strip() if extra.startswith("TUNNELS") else ""
 
         if self.ctrl_writer is not None:  # 新连接顶掉旧的
             log.info("new control %s kicks old control %s", peer, self.ctrl_peer)
@@ -354,7 +371,8 @@ class Relay:
         except Exception:
             self._drop_control()
             return
-        log.info("board online: %s tunnel_id=%s", peer, tunnel_id)
+        log.info("board online: %s tunnel_id=%s socks=%s", peer, tunnel_id,
+                 "on" if self.socks_enabled else "off")
 
         if spec:
             try:

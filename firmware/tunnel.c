@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.0"
+#define TUNNEL_FW_VERSION "v3.1"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -214,6 +214,9 @@ static uint16_t s_relay_port;
 static char s_token[65];
 static char s_pin[24];
 
+/* SOCKS5 开关（管理页控制，经 HELLO 下发给中继；默认开） */
+static uint8_t s_socks_on = 1;
+
 /* 管理页 HTTP 处理串行锁：static 缓冲不允许并发（多访客同时打开会互相踩） */
 static SemaphoreHandle_t s_mgmt_lock;
 
@@ -224,7 +227,7 @@ void tunnel_wifi_connect(void);
 void tunnel_print_info(void);
 
 typedef struct {
-    char magic[4];                /* "M61W"（v2.17：+token/PIN；旧布局读不过会回默认一次） */
+    char magic[4];                /* "M61X"（v3.1：+socks开关；旧布局读不过会回默认一次） */
     uint16_t count;
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -232,6 +235,7 @@ typedef struct {
     uint16_t relay_port;
     char token[65];
     char pin[24];
+    uint8_t socks_on;
     tunnel_map_t entries[CFG_MAX_TARGETS];
     uint32_t crc;                 /* 简单字节和校验 */
 } cfg_blob_t;
@@ -256,6 +260,7 @@ static void map_defaults(void)
     s_relay_port = CFG_RELAY_CTRL_PORT;
     strncpy(s_token, CFG_TOKEN, sizeof(s_token) - 1);
     strncpy(s_pin, CFG_MGMT_PIN, sizeof(s_pin) - 1);
+    s_socks_on = 1;
     const tunnel_map_t def[] = { CFG_DEFAULT_MAP };
     int n = sizeof(def) / sizeof(def[0]);
     if (n > CFG_MAX_TARGETS) {
@@ -271,7 +276,7 @@ static void map_load(void)
 {
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
-    if (memcmp(blob.magic, "M61W", 4) == 0 &&
+    if (memcmp(blob.magic, "M61X", 4) == 0 &&
         blob.count > 0 && blob.count <= CFG_MAX_TARGETS &&
         blob.crc == blob_sum(&blob)) {
         memset(s_map, 0, sizeof(s_map));
@@ -290,6 +295,7 @@ static void map_load(void)
         if (blob.pin[0] != '\0') {
             strncpy(s_pin, blob.pin, sizeof(s_pin) - 1);
         }
+        s_socks_on = blob.socks_on ? 1 : 0;
         for (int i = 0; i < blob.count && i < CFG_MAX_TARGETS; i++) {
             blob.entries[i].target_host[sizeof(blob.entries[i].target_host) - 1] = '\0';
             s_map[i] = blob.entries[i];
@@ -307,7 +313,7 @@ int map_save(void)
 {
     static cfg_blob_t blob;
     memset(&blob, 0, sizeof(blob));
-    memcpy(blob.magic, "M61W", 4);
+    memcpy(blob.magic, "M61X", 4);
     strncpy(blob.wifi_ssid, s_wifi_ssid, sizeof(blob.wifi_ssid) - 1);
     strncpy(blob.wifi_pass, s_wifi_pass, sizeof(blob.wifi_pass) - 1);
     strncpy(blob.relay_host, s_relay_host, sizeof(blob.relay_host) - 1);
@@ -499,6 +505,9 @@ static void mgmt_page(int fd)
                           i, (unsigned)s_map[i].visitor_port, esc,
                           (unsigned)s_map[i].target_port, i);
     }
+    const char *socks_op = s_socks_on ? "socks_off" : "socks_on";
+    const char *socks_label = s_socks_on ? "SOCKS5: ON (click to disable)"
+                                         : "SOCKS5: OFF (click to enable)";
     off = page_append(page, off, cap,
         "</form></table><hr/>"
         "<form method='POST' action='/op'>"
@@ -522,6 +531,10 @@ static void mgmt_page(int fd)
         "<input name='rhost' size='18' placeholder='服务器IP' value='%s'> "
         "<input name='rport' size='6' placeholder='端口' value='%u'> "
         "<button name='op' value='relay'>切换到这个服务器</button></form>"
+        "<hr/><h3>SOCKS5</h3>"
+        "<form method='POST' action='/op'>"
+        "<input type='hidden' name='pw' value='%s'>"
+        "<button name='op' value='%s'>%s</button></form>"
         "<hr/><h3>安全</h3>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -539,6 +552,7 @@ static void mgmt_page(int fd)
         s_wifi_ssid,                        /* wifi ssid 输入框值 */
         s_pin,                              /* relay 表单的 pw */
         s_relay_host, (unsigned)s_relay_port, /* relay 表单 host/port 值 */
+        s_pin, socks_op, socks_label,       /* socks 表单 */
         s_pin, s_pin,                       /* pin/token 表单的 pw */
         TUNNEL_FW_VERSION,                  /* 页脚 */
         s_relay_host, (unsigned)s_relay_port, map_count(), kfree_size());
@@ -723,6 +737,15 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strcmp(op, "socks_on") == 0 || strcmp(op, "socks_off") == 0) {
+        s_socks_on = (strcmp(op, "socks_on") == 0);
+        map_save();
+        const char msg[] = "<html><body><h3>OK</h3>"
+            "<p>SOCKS5 已切换并保存，正在通知中继（几秒内生效）。</p></body></html>";
+        http_respond(fd, 200, "OK", msg, sizeof(msg) - 1);
+        tunnel_apply_now();
+        return 0;
+    }
     if (strcmp(op, "pin") == 0) {
         char newpin[24];
         if (form_value(body, "newpin", newpin, sizeof(newpin)) > 3 &&
@@ -1172,8 +1195,8 @@ static void tunnel_task(void *arg)
         backoff_ms = 2000;
         s_apply_request = 0;
 
-        snprintf(line, sizeof(line), "HELLO %s %s TUNNELS %s\n",
-                 s_token, CFG_TUNNEL_ID, tunnels_field);
+        snprintf(line, sizeof(line), "HELLO %s %s TUNNELS %s SOCKS=%d\n",
+                 s_token, CFG_TUNNEL_ID, tunnels_field, s_socks_on);
         if (send_str(s_ctrl_fd, line) != 0 ||
             recv_line(s_ctrl_fd, line, sizeof(line), 5000) < 0 ||
             strncmp(line, "OK", 2) != 0) {
