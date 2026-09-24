@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v4.1-hw1"
+#define TUNNEL_FW_VERSION "v4.2-hw1"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -635,7 +635,7 @@ static int page_append(char *page, int off, int cap, const char *fmt, ...)
 
 static void mgmt_page(int fd)
 {
-    static char page[4096];
+    static char page[8192];
     char esc[64];
     int off = 0;
     int cap = (int)sizeof(page);
@@ -811,6 +811,10 @@ static void mgmt_page(int fd)
         TUNNEL_FW_VERSION,                  /* 页脚 */
         s_relay_host, (unsigned)s_relay_port, map_count(), kfree_size());
 
+    if (off >= (int)sizeof(page) - 2) {
+        LOG_W("mgmt page truncated! (page buffer %d full, enlarge it)",
+              (int)sizeof(page));
+    }
     http_respond(fd, 200, "OK", page, off);
 }
 
