@@ -29,9 +29,10 @@
 
 
 /* ---------- 硬件模块开关 ----------
- * 0 = 纯透传版（默认）：只有隧道/映射/SOCKS5/网络配置管理页
- * 1 = 硬件交互版：+ GPIO + ADC + PWM（构建时选择，运行时不可切） */
-#define CFG_HW_MODULE     1
+ * 0 = 纯透传版（默认）：只有隧道/映射/SOCKS5/网络配置管理页，体积更小攻击面更小
+ * 1 = 硬件交互版：+ GPIO + ADC + PWM + RGB调光（构建时选择，运行时不可切）
+ *     构建方法: make CHIP=bl616 BOARD=bl616dk 后把此值改 1 重新 make */
+#define CFG_HW_MODULE     0
 
 /* ---------- 硬件模块参数（CFG_HW_MODULE=1 时生效） ---------- */
 #define CFG_MAX_PWMS      4                /* PWM 通道数 */
