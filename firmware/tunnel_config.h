@@ -28,6 +28,16 @@
 #define CFG_CFG_FLASH_ADDR 0x3F3000        /* DATA 分区起始（bl616dk 4M 分区表，SDK 组件未占用） */
 
 
+/* ---------- 硬件模块开关 ----------
+ * 0 = 纯透传版（默认）：只有隧道/映射/SOCKS5/网络配置管理页
+ * 1 = 硬件交互版：+ GPIO + ADC + PWM（构建时选择，运行时不可切） */
+#define CFG_HW_MODULE     1
+
+/* ---------- 硬件模块参数（CFG_HW_MODULE=1 时生效） ---------- */
+#define CFG_MAX_PWMS      4                /* PWM 通道数 */
+#define CFG_ADC_PIN       20               /* ADC 输入引脚（=ADC通道0，GPIO20） */
+#define CFG_UART_BAUD     115200           /* 第二批：UART 透传波特率 */
+
 /* ---------- 限额 ---------- */
 #define CFG_MAX_TUNNELS    8               /* 并发连接槽位（v3: SOCKS5 模式浏览器并发多，提到8） */
 #define CFG_BUF_SIZE       1024

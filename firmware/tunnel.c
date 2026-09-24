@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.10"
+#define TUNNEL_FW_VERSION "v4.0-hw1"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -29,6 +29,9 @@
 
 /* 板载 LED（Zephyr 板级定义，高电平亮）：红=12 绿=14 蓝=15 */
 #include "bflb_gpio.h"
+#include "bflb_pwm_v2.h"
+#include "bflb_clock.h"  /* BFLB_SYSTEM_XCLK */
+#include "bflb_adc.h"
 #define LED_R GPIO_PIN_12
 #define LED_G GPIO_PIN_14
 #define LED_B GPIO_PIN_15
@@ -213,6 +216,49 @@ static gpio_entry_t s_gpios[CFG_MAX_GPIOS];
 
 static uint8_t s_led_manual = 0; /* 1=手动灯效：状态灯任务停刷，12/14/15 解锁给用户 */
 
+/* PWM 通道（管理页增删，flash 持久化）
+ * BL616: PWM0 通道 0-5 对应 GPIO 24/25/26/27/28/29 */
+static const uint8_t s_pwm_pins[6] = {24, 25, 26, 27, 28, 29};
+
+typedef struct {
+    uint8_t pin;      /* 必须是 24-29 */
+    uint16_t freq;    /* Hz, 1-10000 */
+    uint16_t duty;    /* 0-1000 千分比 */
+    uint8_t in_use;
+} pwm_entry_t;
+static pwm_entry_t s_pwms[CFG_MAX_PWMS];
+
+static int pwm_ch_from_pin(uint8_t pin)
+{
+    for (int i = 0; i < 6; i++) {
+        if (s_pwm_pins[i] == pin) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void pwm_apply(pwm_entry_t *e)
+{
+    int ch = pwm_ch_from_pin(e->pin);
+    if (ch < 0 || e->freq == 0) {
+        return;
+    }
+    struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
+    struct bflb_device_s *pwm = bflb_device_get_by_name("pwm_v2_0");
+    bflb_gpio_init(gpio, e->pin, GPIO_FUNC_PWM0 | GPIO_ALTERNATE | GPIO_SMT_EN | GPIO_DRV_1);
+    struct bflb_pwm_v2_config_s cfg = {
+        .clk_source = BFLB_SYSTEM_XCLK,
+        .clk_div = 40,                          /* 2MHz 计数 */
+        .period = 2000000 / e->freq,            /* 目标频率 */
+    };
+    bflb_pwm_v2_init(pwm, &cfg);
+    uint32_t th = (uint32_t)e->duty * cfg.period / 1000;
+    bflb_pwm_v2_channel_set_threshold(pwm, ch, 0, th);
+    bflb_pwm_v2_channel_positive_start(pwm, ch);
+    bflb_pwm_v2_start(pwm);
+}
+
 static int gpio_pin_reserved(uint8_t pin)
 {
     if (s_led_manual) {
@@ -271,6 +317,37 @@ static char s_socks_pass[33];
 /* 管理页 HTTP 处理串行锁：static 缓冲不允许并发（多访客同时打开会互相踩） */
 static SemaphoreHandle_t s_mgmt_lock;
 
+/* ADC：模拟量读取（默认引脚 CFG_ADC_PIN=GPIO20/通道0；返回 mV） */
+static int adc_read_mv(void)
+{
+    struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
+    struct bflb_device_s *adc = bflb_device_get_by_name("adc");
+    bflb_gpio_init(gpio, CFG_ADC_PIN, GPIO_ANALOG | GPIO_SMT_EN | GPIO_DRV_0);
+    struct bflb_adc_config_s cfg = {
+        .clk_div = ADC_CLK_DIV_32,
+        .scan_conv_mode = false,
+        .continuous_conv_mode = false,
+        .differential_mode = false,
+        .vref = ADC_VREF_3P2V,
+        .resolution = ADC_RESOLUTION_12B,
+    };
+    bflb_adc_init(adc, &cfg);
+    struct bflb_adc_channel_s chan[] = { { .pos_chan = ADC_CHANNEL_0, .neg_chan = ADC_CHANNEL_GND } };
+    bflb_adc_channel_config(adc, chan, 1);
+    bflb_adc_start_conversion(adc);
+    for (int i = 0; i < 100; i++) {
+        if (bflb_adc_get_count(adc) >= 1) {
+            break;
+        }
+        vTaskDelay(1);
+    }
+    uint32_t raw = bflb_adc_read_raw(adc);
+    struct bflb_adc_result_s result;
+    bflb_adc_parse_result(adc, &raw, &result, 1);
+    /* millivolt (3.2V 满量程) */
+    return result.millivolt;
+}
+
 /* 前向声明（map_load 首次会写默认表进 flash；mgmt 保存后触发重连） */
 int map_save(void);
 void tunnel_apply_now(void);
@@ -278,7 +355,7 @@ void tunnel_wifi_connect(void);
 void tunnel_print_info(void);
 
 typedef struct {
-    char magic[4];                /* "M62B"（v3.8：默认零映射；旧布局读不过会回默认一次） */
+    char magic[4];                /* "M63A"（v4.0：+PWM表；旧布局读不过会回默认一次） */
     uint16_t count;
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -289,6 +366,7 @@ typedef struct {
     uint8_t socks_on;
     char socks_pass[33];
     gpio_entry_t gpios[CFG_MAX_GPIOS];
+    pwm_entry_t pwms[CFG_MAX_PWMS];
     tunnel_map_t entries[CFG_MAX_TARGETS];
     uint32_t crc;                 /* 简单字节和校验 */
 } cfg_blob_t;
@@ -323,7 +401,7 @@ static void map_load(void)
 {
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
-    if (memcmp(blob.magic, "M62B", 4) == 0 &&
+    if (memcmp(blob.magic, "M63A", 4) == 0 &&
         blob.count <= CFG_MAX_TARGETS &&  /* v3.10 修复：count=0（零映射）也是合法配置，
                                              旧的 count>0 校验会让空映射时全部配置被判无效 */
         blob.crc == blob_sum(&blob)) {
@@ -349,6 +427,9 @@ static void map_load(void)
         for (int i = 0; i < CFG_MAX_GPIOS; i++) {
             s_gpios[i] = blob.gpios[i];
         }
+        for (int i = 0; i < CFG_MAX_PWMS; i++) {
+            s_pwms[i] = blob.pwms[i];
+        }
         for (int i = 0; i < blob.count && i < CFG_MAX_TARGETS; i++) {
             blob.entries[i].target_host[sizeof(blob.entries[i].target_host) - 1] = '\0';
             s_map[i] = blob.entries[i];
@@ -366,7 +447,7 @@ int map_save(void)
 {
     static cfg_blob_t blob;
     memset(&blob, 0, sizeof(blob));
-    memcpy(blob.magic, "M62B", 4);
+    memcpy(blob.magic, "M63A", 4);
     strncpy(blob.wifi_ssid, s_wifi_ssid, sizeof(blob.wifi_ssid) - 1);
     strncpy(blob.wifi_pass, s_wifi_pass, sizeof(blob.wifi_pass) - 1);
     strncpy(blob.relay_host, s_relay_host, sizeof(blob.relay_host) - 1);
@@ -588,6 +669,25 @@ static void mgmt_page(int fd)
             s_gpios[i].is_output ? (lvl ? "拉低" : "拉高") : "-");
     }
 
+    static char pwm_rows[1200];
+    int poff = 0;
+    pwm_rows[0] = '\0';
+    for (int i = 0; i < CFG_MAX_PWMS && poff < (int)sizeof(pwm_rows) - 200; i++) {
+        if (!s_pwms[i].in_use) {
+            continue;
+        }
+        poff = page_append(pwm_rows, poff, (int)sizeof(pwm_rows),
+            "<tr><td>%d</td><td>%dHz</td><td>%d</td><td>"
+            "<form method='POST' action='/op'>"
+            "<input type='hidden' name='pw' value='%s'>"
+            "<input type='hidden' name='pidx' value='%d'>"
+            "<input name='pduty' size='5' value='%d'> "
+            "<button name='op' value='pwm_duty'>改占空</button>"
+            "<button name='op' value='pwm_del'>删</button></form></td></tr>",
+            (int)s_pwms[i].pin, (int)s_pwms[i].freq, (int)s_pwms[i].duty,
+            s_pin, i, (int)s_pwms[i].duty);
+    }
+
     const char *socks_op = s_socks_on ? "socks_off" : "socks_on";
     const char *socks_label = s_socks_on ? "SOCKS5: ON (click to disable)"
                                          : "SOCKS5: OFF (click to enable)";
@@ -622,7 +722,20 @@ static void mgmt_page(int fd)
         "<option value='in'>输入</option></select></td>"
         "<td>-</td><td><button name='op' value='gpio_add'>添加</button></td></tr></form>"
         "%s"
-        "</table>(状态模式下 pin12/14/15 保留给状态灯)"
+        "</table>(状态模式下 pin12/14/15 保留给状态灯; GPIO24-29 为PWM专用)"
+        "<tr><td colspan=4>ADC: <b>%d mV</b> (pin%d)</td></tr>"
+        "</table>"
+        "<h4>PWM</h4><table><tr><th>pin</th><th>freq</th><th>duty&permil;</th><th>op</th></tr>"
+        "<form method='POST' action='/op'>"
+        "<input type='hidden' name='pw' value='%s'>"
+        "<tr><td><select name='ppin'>"
+        "<option>24</option><option>25</option><option>26</option>"
+        "<option>27</option><option>28</option><option>29</option></select></td>"
+        "<td><input name='pfreq' size='6' value='1000'></td>"
+        "<td><input name='pduty' size='5' value='500'></td>"
+        "<td><button name='op' value='pwm_add'>添加</button></td></tr></form>"
+        "%s"
+        "</table>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
         "<button name='op' value='ledmode'>灯效模式切换(状态灯⇄手动)</button></form>"
@@ -655,6 +768,9 @@ static void mgmt_page(int fd)
         s_relay_host, (unsigned)s_relay_port, /* relay 表单 host/port 值 */
         s_pin,                             /* gpio 添加表单 pw */
         gpio_rows,                         /* gpio 表格行 */
+        adc_read_mv(), CFG_ADC_PIN,        /* ADC 实时读数 */
+        s_pin,                             /* pwm 添加表单 pw */
+        pwm_rows,                          /* pwm 表格行 */
         s_pin,                             /* 灯效切换按钮 pw */
         s_pin, socks_op, socks_label,       /* socks 开关表单 */
         s_pin,                              /* socks 密码表单 pw */
@@ -744,6 +860,43 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strncmp(path, "/adc", 4) == 0) {
+        static char mv[16];
+        int n = snprintf(mv, sizeof(mv), "%d", adc_read_mv());
+        http_respond(fd, 200, "OK", mv, n);
+        return 0;
+    }
+    if (strncmp(path, "/pwm", 4) == 0) {
+        char vpin[8], vfreq[10], vduty[8];
+        if (form_value(req_head, "pin", vpin, sizeof(vpin)) > 0) {
+            int pin = atoi(vpin);
+            for (int i = 0; i < CFG_MAX_PWMS; i++) {
+                if (s_pwms[i].in_use && s_pwms[i].pin == pin) {
+                    int dirty = 0;
+                    if (form_value(req_head, "freq", vfreq, sizeof(vfreq)) > 0) {
+                        int f = atoi(vfreq);
+                        if (f >= 1 && f <= 10000) { s_pwms[i].freq = (uint16_t)f; dirty = 1; }
+                    }
+                    if (form_value(req_head, "duty", vduty, sizeof(vduty)) > 0) {
+                        int d = atoi(vduty);
+                        if (d >= 0 && d <= 1000) { s_pwms[i].duty = (uint16_t)d; dirty = 1; }
+                    }
+                    if (dirty) {
+                        pwm_apply(&s_pwms[i]);
+                        map_save();
+                    }
+                    static char buf[48];
+                    int n = snprintf(buf, sizeof(buf), "%dHz %d/1000", s_pwms[i].freq, s_pwms[i].duty);
+                    http_respond(fd, 200, "OK", buf, n);
+                    return 0;
+                }
+            }
+            http_respond(fd, 404, "Not Found", "pin not configured", 18);
+            return 0;
+        }
+        http_respond(fd, 400, "Bad Request", "need pin", 8);
+        return 0;
+    }
     if (strncmp(path, "/gpio", 5) == 0) {
         /* 脚本接口：GET /gpio?pw=x&pin=12&set=1  /  &get=1 → 文本返回 0/1 */
         char vpin[8], vset[4], vget[4];
@@ -930,6 +1083,59 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
                 } else if (s_gpios[i].is_output) {
                     s_gpios[i].out_val ^= 1;
                     gpio_apply(&s_gpios[i]);
+                }
+                map_save();
+            }
+        }
+        mgmt_page(fd);
+        return 0;
+    }
+    if (strcmp(op, "pwm_add") == 0) {
+        char ppin[8], pfreq[10], pduty[8];
+        if (form_value(body, "ppin", ppin, sizeof(ppin)) > 0 &&
+            form_value(body, "pfreq", pfreq, sizeof(pfreq)) > 0 &&
+            form_value(body, "pduty", pduty, sizeof(pduty)) > 0) {
+            int pin = atoi(ppin);
+            int freq = atoi(pfreq);
+            int duty = atoi(pduty);
+            if (pwm_ch_from_pin((uint8_t)pin) < 0 || freq < 1 || freq > 10000 ||
+                duty < 0 || duty > 1000) {
+                const char msg[] = "<html><body><h3>参数错误</h3>"
+                    "<p>PWM 引脚限 24-29；频率 1-10000Hz；占空比 0-1000(&permil;)。</p></body></html>";
+                http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+                return 0;
+            }
+            for (int i = 0; i < CFG_MAX_PWMS; i++) {
+                if (!s_pwms[i].in_use) {
+                    memset(&s_pwms[i], 0, sizeof(s_pwms[i]));
+                    s_pwms[i].pin = (uint8_t)pin;
+                    s_pwms[i].freq = (uint16_t)freq;
+                    s_pwms[i].duty = (uint16_t)duty;
+                    s_pwms[i].in_use = 1;
+                    pwm_apply(&s_pwms[i]);
+                    map_save();
+                    break;
+                }
+            }
+        }
+        mgmt_page(fd);
+        return 0;
+    }
+    if (strcmp(op, "pwm_del") == 0 || strcmp(op, "pwm_duty") == 0) {
+        char pidx[8], pduty[8];
+        if (form_value(body, "pidx", pidx, sizeof(pidx)) > 0) {
+            int i = atoi(pidx);
+            if (i >= 0 && i < CFG_MAX_PWMS && s_pwms[i].in_use) {
+                if (strcmp(op, "pwm_del") == 0) {
+                    s_pwms[i].in_use = 0;
+                    struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
+                    bflb_gpio_init(gpio, s_pwms[i].pin, GPIO_INPUT | GPIO_PULLDOWN | GPIO_SMT_EN | GPIO_DRV_0);
+                } else if (form_value(body, "pduty", pduty, sizeof(pduty)) > 0) {
+                    int duty = atoi(pduty);
+                    if (duty >= 0 && duty <= 1000) {
+                        s_pwms[i].duty = (uint16_t)duty;
+                        pwm_apply(&s_pwms[i]);
+                    }
                 }
                 map_save();
             }
@@ -1590,6 +1796,11 @@ void tunnel_init(void)
     inited = 1;
     map_load();
     gpio_apply_all();
+    for (int i = 0; i < CFG_MAX_PWMS; i++) {
+        if (s_pwms[i].in_use) {
+            pwm_apply(&s_pwms[i]);
+        }
+    }
     tunnel_print_info(); /* 开机自报家门 */
     s_mgmt_lock = xSemaphoreCreateMutex();
     xTaskCreate(ap_watchdog_task, "apwd", 512, NULL, 10, NULL);
