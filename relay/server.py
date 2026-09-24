@@ -49,6 +49,7 @@ class Relay:
         self.next_cid = 1
         self.tunnels = {}                # tid -> {"vport": int, "target": str, "server": asyncio.Server}
         self.socks_enabled = True        # 板子经 HELLO ... SOCKS=0/1 控制，管理页开关
+        self.socks_pass = None           # 板子经 HELLO ... SOCKS_PASS=xxx 下发；None=回退用 token
         self.board_last_seen = 0.0
         self.stats = {"visitor_total": 0, "tunnel_ok": 0, "tunnel_fail": 0,
                       "bytes_board_to_visitor": 0, "bytes_visitor_to_board": 0,
@@ -203,7 +204,8 @@ class Relay:
             user = (await asyncio.wait_for(reader.readexactly(ulen), 10)).decode("utf-8", "replace")
             plen = (await asyncio.wait_for(reader.readexactly(1), 10))[0]
             password = (await asyncio.wait_for(reader.readexactly(plen), 10)).decode("utf-8", "replace")
-            if not self.token_ok(password):
+            expect = self.socks_pass if self.socks_pass is not None else self.token
+            if not hmac.compare_digest(password, expect):
                 writer.write(b"\x01\x01")
                 await writer.drain()
                 self._close_writer(writer)
@@ -345,8 +347,13 @@ class Relay:
             return
         tunnel_id = parts[2][:64]
         extra = parts[3] if len(parts) > 3 else ""
-        # SOCKS=n 字段独立摘取（可出现在 TUNNELS 段内/后，或独立存在）
+        # SOCKS=n / SOCKS_PASS=xxx 字段独立摘取（可出现在 TUNNELS 段内/后）
         socks_val = None
+        if "SOCKS_PASS=" in extra:
+            idx = extra.find("SOCKS_PASS=")
+            tail = extra[idx + 11:].split(None, 1)[0]
+            self.socks_pass = tail if tail else None
+            extra = (extra[:idx] + " " + extra[idx + 11 + len(tail):]).strip()
         if "SOCKS=" in extra:
             idx = extra.find("SOCKS=")
             tail = extra[idx + 6:].split(None, 1)[0]
@@ -371,8 +378,9 @@ class Relay:
         except Exception:
             self._drop_control()
             return
-        log.info("board online: %s tunnel_id=%s socks=%s", peer, tunnel_id,
-                 "on" if self.socks_enabled else "off")
+        log.info("board online: %s tunnel_id=%s socks=%s pass=%s", peer, tunnel_id,
+                 "on" if self.socks_enabled else "off",
+                 "custom" if self.socks_pass is not None else "token")
 
         if spec:
             try:

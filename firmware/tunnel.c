@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.2"
+#define TUNNEL_FW_VERSION "v3.3"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -214,8 +214,10 @@ static uint16_t s_relay_port;
 static char s_token[65];
 static char s_pin[24];
 
-/* SOCKS5 开关（管理页控制，经 HELLO 下发给中继；默认关，手动开启） */
+/* SOCKS5 开关（管理页控制，经 HELLO 下发给中继；默认关，手动开启）
+ * 独立密码（可与管理页 PIN/token 不同；开启前必须设置） */
 static uint8_t s_socks_on = 0;
+static char s_socks_pass[33];
 
 /* 管理页 HTTP 处理串行锁：static 缓冲不允许并发（多访客同时打开会互相踩） */
 static SemaphoreHandle_t s_mgmt_lock;
@@ -227,7 +229,7 @@ void tunnel_wifi_connect(void);
 void tunnel_print_info(void);
 
 typedef struct {
-    char magic[4];                /* "M61Y"（v3.2：socks默认关；旧布局读不过会回默认一次） */
+    char magic[4];                /* "M61Z"（v3.3：+socks独立密码；旧布局读不过会回默认一次） */
     uint16_t count;
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -236,6 +238,7 @@ typedef struct {
     char token[65];
     char pin[24];
     uint8_t socks_on;
+    char socks_pass[33];
     tunnel_map_t entries[CFG_MAX_TARGETS];
     uint32_t crc;                 /* 简单字节和校验 */
 } cfg_blob_t;
@@ -261,6 +264,7 @@ static void map_defaults(void)
     strncpy(s_token, CFG_TOKEN, sizeof(s_token) - 1);
     strncpy(s_pin, CFG_MGMT_PIN, sizeof(s_pin) - 1);
     s_socks_on = 0;
+    s_socks_pass[0] = '\0';
     const tunnel_map_t def[] = { CFG_DEFAULT_MAP };
     int n = sizeof(def) / sizeof(def[0]);
     if (n > CFG_MAX_TARGETS) {
@@ -276,7 +280,7 @@ static void map_load(void)
 {
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
-    if (memcmp(blob.magic, "M61Y", 4) == 0 &&
+    if (memcmp(blob.magic, "M61Z", 4) == 0 &&
         blob.count > 0 && blob.count <= CFG_MAX_TARGETS &&
         blob.crc == blob_sum(&blob)) {
         memset(s_map, 0, sizeof(s_map));
@@ -296,6 +300,8 @@ static void map_load(void)
             strncpy(s_pin, blob.pin, sizeof(s_pin) - 1);
         }
         s_socks_on = blob.socks_on ? 1 : 0;
+        blob.socks_pass[sizeof(blob.socks_pass) - 1] = '\0';
+        strncpy(s_socks_pass, blob.socks_pass, sizeof(s_socks_pass) - 1);
         for (int i = 0; i < blob.count && i < CFG_MAX_TARGETS; i++) {
             blob.entries[i].target_host[sizeof(blob.entries[i].target_host) - 1] = '\0';
             s_map[i] = blob.entries[i];
@@ -313,7 +319,7 @@ int map_save(void)
 {
     static cfg_blob_t blob;
     memset(&blob, 0, sizeof(blob));
-    memcpy(blob.magic, "M61Y", 4);
+    memcpy(blob.magic, "M61Z", 4);
     strncpy(blob.wifi_ssid, s_wifi_ssid, sizeof(blob.wifi_ssid) - 1);
     strncpy(blob.wifi_pass, s_wifi_pass, sizeof(blob.wifi_pass) - 1);
     strncpy(blob.relay_host, s_relay_host, sizeof(blob.relay_host) - 1);
@@ -535,6 +541,11 @@ static void mgmt_page(int fd)
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
         "<button name='op' value='%s'>%s</button></form>"
+        "<form method='POST' action='/op'>"
+        "<input type='hidden' name='pw' value='%s'>"
+        "<input name='newsockspass' size='12' placeholder='SOCKS5密码'> "
+        "<button name='op' value='sockspass'>设置SOCKS5密码</button>"
+        "(开启前必须设置;当前:%s)</form>"
         "<hr/><h3>安全</h3>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -552,7 +563,9 @@ static void mgmt_page(int fd)
         s_wifi_ssid,                        /* wifi ssid 输入框值 */
         s_pin,                              /* relay 表单的 pw */
         s_relay_host, (unsigned)s_relay_port, /* relay 表单 host/port 值 */
-        s_pin, socks_op, socks_label,       /* socks 表单 */
+        s_pin, socks_op, socks_label,       /* socks 开关表单 */
+        s_pin,                              /* socks 密码表单 pw */
+        s_socks_pass[0] ? s_socks_pass : "(未设置)", /* 当前密码提示 */
         s_pin, s_pin,                       /* pin/token 表单的 pw */
         TUNNEL_FW_VERSION,                  /* 页脚 */
         s_relay_host, (unsigned)s_relay_port, map_count(), kfree_size());
@@ -738,12 +751,35 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
     }
 
     if (strcmp(op, "socks_on") == 0 || strcmp(op, "socks_off") == 0) {
+        if (strcmp(op, "socks_on") == 0 && s_socks_pass[0] == '\0') {
+            const char msg[] = "<html><body><h3>请先设置SOCKS5密码</h3>"
+                "<p>安全要求：开启前必须先在下方设置一个密码。</p></body></html>";
+            http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+            return 0;
+        }
         s_socks_on = (strcmp(op, "socks_on") == 0);
         map_save();
         const char msg[] = "<html><body><h3>OK</h3>"
             "<p>SOCKS5 已切换并保存，正在通知中继（几秒内生效）。</p></body></html>";
         http_respond(fd, 200, "OK", msg, sizeof(msg) - 1);
         tunnel_apply_now();
+        return 0;
+    }
+    if (strcmp(op, "sockspass") == 0) {
+        char np[33];
+        if (form_value(body, "newsockspass", np, sizeof(np)) > 3 &&
+            strlen(np) < sizeof(s_socks_pass)) {
+            memset(s_socks_pass, 0, sizeof(s_socks_pass));
+            strncpy(s_socks_pass, np, sizeof(s_socks_pass) - 1);
+            map_save();
+            const char msg[] = "<html><body><h3>OK SOCKS5 密码已设置</h3>"
+                "<p>已保存。SOCKS5 客户端（浏览器代理等）的密码用它，"
+                "不再是长 token。</p></body></html>";
+            http_respond(fd, 200, "OK", msg, sizeof(msg) - 1);
+            tunnel_apply_now();
+            return 0;
+        }
+        http_respond(fd, 400, "Bad Request", "password too short (min 4)", 27);
         return 0;
     }
     if (strcmp(op, "pin") == 0) {
@@ -1176,7 +1212,7 @@ void tunnel_apply_now(void)
 
 static void tunnel_task(void *arg)
 {
-    char line[320];
+    char line[384];
     char tunnels_field[224];
     uint32_t last_ping = 0, last_pong = 0, backoff_ms = 2000;
 
@@ -1195,8 +1231,8 @@ static void tunnel_task(void *arg)
         backoff_ms = 2000;
         s_apply_request = 0;
 
-        snprintf(line, sizeof(line), "HELLO %s %s TUNNELS %s SOCKS=%d\n",
-                 s_token, CFG_TUNNEL_ID, tunnels_field, s_socks_on);
+        snprintf(line, sizeof(line), "HELLO %s %s TUNNELS %s SOCKS=%d SOCKS_PASS=%s\n",
+                 s_token, CFG_TUNNEL_ID, tunnels_field, s_socks_on, s_socks_pass);
         if (send_str(s_ctrl_fd, line) != 0 ||
             recv_line(s_ctrl_fd, line, sizeof(line), 5000) < 0 ||
             strncmp(line, "OK", 2) != 0) {

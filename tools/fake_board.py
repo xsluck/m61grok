@@ -75,9 +75,10 @@ class FakeBoard:
         self.ctrl_reader, self.ctrl_writer = await asyncio.open_connection(
             self.args.relay_host, self.args.ctrl_port)
         spec = ",".join("%d=%s:%d" % t for t in self.tunnels)
-        hello = ("HELLO %s %s TUNNELS %s SOCKS=%d\n"
+        hello = ("HELLO %s %s TUNNELS %s SOCKS=%d SOCKS_PASS=%s\n"
                  % (self.args.token, self.args.tunnel_id, spec,
-                    getattr(self.args, "socks", 1)))
+                    getattr(self.args, "socks", 1),
+                    getattr(self.args, "socks_pass", "") or ""))
         self.ctrl_writer.write(hello.encode())
         await self.ctrl_writer.drain()
         line = await readline(self.ctrl_reader, 10)
@@ -206,6 +207,7 @@ async def main():
                     help="v1 单目标：要隧道到的本地服务")
     ap.add_argument("--public-port", type=int, default=7002,
                     help="v1 单目标对应的公网访客端口（默认 7002）")
+    ap.add_argument("--socks-pass", default="", help="SOCKS5 独立密码（空=回退token）")
     ap.add_argument("--socks", type=int, default=1, choices=[0, 1],
                     help="SOCKS5 开关（随 HELLO 下发中继）")
     ap.add_argument("--tunnels", default=None,
