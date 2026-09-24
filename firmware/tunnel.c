@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.4"
+#define TUNNEL_FW_VERSION "v3.5"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -805,8 +805,20 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
     }
     if (strcmp(op, "token") == 0) {
         char newtoken[65];
-        if (form_value(body, "newtoken", newtoken, sizeof(newtoken)) > 7 &&
-            strlen(newtoken) < sizeof(s_token) && s_ctrl_fd >= 0) {
+        int tok_len = form_value(body, "newtoken", newtoken, sizeof(newtoken));
+        if (tok_len > 0 && tok_len <= 5) {
+            const char msg[] = "<html><body><h3>token 太短</h3>"
+                "<p>至少 6 个字符（建议 8 位以上更安全）。</p></body></html>";
+            http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+            return 0;
+        }
+        if (s_ctrl_fd < 0) {
+            const char msg[] = "<html><body><h3>隧道当前离线</h3>"
+                "<p>改 token 需要隧道在线（蓝灯灭时再试）。</p></body></html>";
+            http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+            return 0;
+        }
+        if (tok_len > 5 && strlen(newtoken) < sizeof(s_token)) {
             memset(s_token_new, 0, sizeof(s_token_new));
             strncpy(s_token_new, newtoken, sizeof(s_token_new) - 1);
             s_token_req = 1;
@@ -830,7 +842,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
             }
             return 0;
         }
-        http_respond(fd, 400, "Bad Request", "token invalid or tunnel offline", 32);
+        http_respond(fd, 400, "Bad Request", "bad token", 9);
         return 0;
     }
 

@@ -401,7 +401,7 @@ class Relay:
                     await writer.drain()
                 elif line.startswith("SETTOKEN "):
                     new_tok = line[9:].strip()
-                    if len(new_tok) >= 8 and " " not in new_tok:
+                    if len(new_tok) >= 6 and " " not in new_tok:
                         old_tok = self.token
                         self.token = new_tok
                         ok = True
@@ -420,7 +420,7 @@ class Relay:
                         if ok:
                             log.info("token updated by board (persisted)")
                     else:
-                        writer.write(b"ERR bad token (min 8, no spaces)\n")
+                        writer.write(b"ERR bad token (min 6, no spaces)\n")
                         await writer.drain()
                 elif line:
                     log.debug("control msg ignored: %r", line[:80])
