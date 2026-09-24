@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v2.19"
+#define TUNNEL_FW_VERSION "v3.0"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -370,7 +370,7 @@ void tunnel_wifi_save_current(void)
     LOG_I("wifi credentials auto-saved: %s", s_wifi_ssid);
 }
 
-/* HELLO 里 TUNNELS 字段的序列化：21114=192.168.1.100:8080,21116=local:80 */
+/* HELLO 里 TUNNELS 字段的序列化：21114=192.168.0.127:8080,21116=local:80 */
 static void map_serialize(char *out, int outlen)
 {
     int off = 0;
@@ -980,7 +980,9 @@ SHELL_CMD_EXPORT_ALIAS(cmd_info, info, print m61-tunnel info);
 typedef struct {
     volatile int in_use;
     uint32_t cid;
-    int map_idx;    /* 目标在 s_map 的下标 */
+    int map_idx;    /* 目标在 s_map 的下标；-1 = SOCKS5 动态目标 */
+    char dyn_host[48]; /* SOCKS5 动态目标（中继下发的任意内网地址） */
+    uint16_t dyn_port;
     int relay_fd;
     int local_fd;
     uint32_t last_ms;
@@ -992,7 +994,7 @@ static tunnel_slot_t s_slots[CFG_MAX_TUNNELS];
 static void tunnel_data_task(void *arg)
 {
     tunnel_slot_t *s = (tunnel_slot_t *)arg;
-    char line[112];
+    char line[128];
     const tunnel_map_t *m = (s->map_idx >= 0 && s->map_idx < CFG_MAX_TARGETS) ?
                              &s_map[s->map_idx] : NULL;
 
@@ -1001,8 +1003,13 @@ static void tunnel_data_task(void *arg)
         if (s->relay_fd < 0) {
             break;
         }
-        snprintf(line, sizeof(line), "AUTH %s %d %lu\n", s_token,
-                 s->map_idx, (unsigned long)s->cid);
+        if (s->map_idx >= 0) {
+            snprintf(line, sizeof(line), "AUTH %s %d %lu\n", s_token,
+                     s->map_idx, (unsigned long)s->cid);
+        } else {
+            snprintf(line, sizeof(line), "AUTHX %s %lu %s %u\n", s_token,
+                     (unsigned long)s->cid, s->dyn_host, (unsigned)s->dyn_port);
+        }
         if (send_str(s->relay_fd, line) != 0) {
             break;
         }
@@ -1013,7 +1020,16 @@ static void tunnel_data_task(void *arg)
         }
 
         int is_local = (m && strcmp(m->target_host, "local") == 0);
-        if (!is_local && m) {
+        if (s->map_idx < 0) { /* SOCKS5 动态目标 */
+            s->local_fd = tcp_connect_host(s->dyn_host, s->dyn_port);
+            if (s->local_fd < 0) {
+                LOG_W("cid %lu socks target %s:%u unreachable",
+                      (unsigned long)s->cid, s->dyn_host, (unsigned)s->dyn_port);
+                break;
+            }
+            LOG_I("cid %lu socks up: -> %s:%u", (unsigned long)s->cid,
+                  s->dyn_host, (unsigned)s->dyn_port);
+        } else if (!is_local && m) {
             s->local_fd = tcp_connect_host(m->target_host, m->target_port);
             if (s->local_fd < 0) {
                 LOG_W("cid %lu target %s:%u unreachable",
@@ -1085,10 +1101,14 @@ static void tunnel_data_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void handle_open(int map_idx, uint32_t cid)
+static void handle_open(int map_idx, uint32_t cid, const char *dyn_host, uint16_t dyn_port)
 {
-    if (map_idx < 0 || map_idx >= CFG_MAX_TARGETS || !s_map[map_idx].in_use) {
+    if (map_idx >= 0 && (map_idx >= CFG_MAX_TARGETS || !s_map[map_idx].in_use)) {
         LOG_W("OPEN bad map_idx %d", map_idx);
+        return;
+    }
+    if (map_idx < 0 && (dyn_host == NULL || dyn_port == 0)) {
+        LOG_W("OPENX missing target");
         return;
     }
     for (int i = 0; i < CFG_MAX_TUNNELS; i++) {
@@ -1097,6 +1117,10 @@ static void handle_open(int map_idx, uint32_t cid)
             s_slots[i].in_use = 1;
             s_slots[i].cid = cid;
             s_slots[i].map_idx = map_idx;
+            if (map_idx < 0) {
+                strncpy(s_slots[i].dyn_host, dyn_host, sizeof(s_slots[i].dyn_host) - 1);
+                s_slots[i].dyn_port = dyn_port;
+            }
             s_slots[i].relay_fd = -1;
             s_slots[i].local_fd = -1;
             s_slots[i].last_ms = now_ms();
@@ -1179,13 +1203,21 @@ static void tunnel_task(void *arg)
             if (recv_line(s_ctrl_fd, line, sizeof(line), 500) > 0) {
                 if (strcmp(line, "PONG") == 0) {
                     last_pong = now_ms();
+                } else if (strncmp(line, "OPENX ", 6) == 0) {
+                    /* v3 SOCKS5: OPENX <cid> <host> <port> */
+                    unsigned long cid = 0;
+                    char host[48];
+                    unsigned port = 0;
+                    if (sscanf(line + 6, "%lu %47s %u", &cid, host, &port) == 3) {
+                        handle_open(-1, (uint32_t)cid, host, (uint16_t)port);
+                    }
                 } else if (strncmp(line, "OPEN ", 5) == 0) {
                     int map_idx = -1;
                     unsigned long cid = 0;
                     if (sscanf(line + 5, "%d %lu", &map_idx, &cid) == 2) {
-                        handle_open(map_idx, (uint32_t)cid);
+                        handle_open(map_idx, (uint32_t)cid, NULL, 0);
                     } else if (sscanf(line + 5, "%lu", &cid) == 1) {
-                        handle_open(0, (uint32_t)cid); /* v1 兼容：不带 tid */
+                        handle_open(0, (uint32_t)cid, NULL, 0); /* v1 兼容 */
                     }
                 }
             }

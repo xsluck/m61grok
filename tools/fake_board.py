@@ -94,6 +94,11 @@ class FakeBoard:
             if line == "PING":
                 self.ctrl_writer.write(b"PONG\n")
                 await self.ctrl_writer.drain()
+            elif line.startswith("OPENX"):  # v3 SOCKS5: OPENX cid host port
+                parts = line.split()
+                if len(parts) == 4:
+                    asyncio.ensure_future(self.data_channel(
+                        int(parts[1]), -1, parts[2], int(parts[3])))
             elif line.startswith("OPEN"):
                 parts = line.split()          # v2: OPEN tid cid / v1: OPEN cid
                 if len(parts) == 3:
@@ -106,12 +111,15 @@ class FakeBoard:
 
     # ---------- 数据通道 ----------
 
-    async def data_channel(self, cid, tid):
+    async def data_channel(self, cid, tid, dyn_host=None, dyn_port=0):
         w = None
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(self.args.relay_host, self.args.data_port), 10)
-            w.write(("AUTH %s %d %d\n" % (self.args.token, tid, cid)).encode())
+            if tid < 0:
+                w.write(("AUTHX %s %d %s %d\n" % (self.args.token, cid, dyn_host, dyn_port)).encode())
+            else:
+                w.write(("AUTH %s %d %d\n" % (self.args.token, tid, cid)).encode())
             await w.drain()
             line = await readline(r, 10)
             if not line or not line.startswith("OK"):
@@ -120,7 +128,9 @@ class FakeBoard:
             log.info("cid %d (tid %d) data channel up", cid, tid)
 
             thost = tport = None
-            if tid < len(self.tunnels):
+            if tid < 0:
+                thost, tport = dyn_host, dyn_port
+            elif tid < len(self.tunnels):
                 _, thost, tport = self.tunnels[tid]
             if thost:
                 tr, tw = await asyncio.open_connection(thost, tport)

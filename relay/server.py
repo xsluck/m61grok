@@ -6,6 +6,11 @@ m61-tunnel relay v2 —— ngrok 式反向隧道中继，跑在有公网 IP 的 
 用法（推荐单端口模式，板子出站只需要能到 7000 一个端口）：
   python3 server.py --token <TOKEN> --single-port 7000
 
+v3 SOCKS5：
+  单端口模式下 SOCKS5 与控制/数据/状态页共用端口（首字节 0x05 自动识别），
+  认证用隧道 token（RFC1929 用户名任意/密码=token），连接内网任意 IP:端口。
+  新消息: OPENX <cid> <host> <port> / AUTHX <token> <cid> <host> <port>
+
 v2 多目标：
   板子 HELLO 时带上映射表: HELLO <token> <id> TUNNELS 21114=192.168.0.127:8080,21116=local:80
   中继为每个公网访客端口（21114...）开监听；访客连哪个端口就转发到哪个目标。
@@ -76,6 +81,15 @@ class Relay:
             raise TimeoutError("first line timeout")
         return bytes(raw), raw.decode("utf-8", "replace").rstrip("\r\n")
 
+    def _privnet_only(self, host: str) -> bool:
+        """SOCKS 目标白名单：默认只放行私网地址（防被当开放代理滥用）。"""
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(host)
+            return ip.is_private or ip.is_loopback
+        except ValueError:
+            return False
+
     def _close_writer(self, writer):
         try:
             writer.close()
@@ -131,12 +145,24 @@ class Relay:
     # ---------- 连接处理器 ----------
 
     async def handle_client(self, reader, writer):
-        """单端口(7000)总入口：HELLO=控制，AUTH=数据，其他=说明页。"""
+        """单端口(7000)总入口：0x05=SOCKS5，HELLO=控制，AUTH=数据，其他=说明页。"""
+        try:
+            first = await asyncio.wait_for(reader.readexactly(1), 15)
+        except Exception:
+            self._close_writer(writer)
+            return
+        if first == b"\x05":
+            await self._socks5_flow(reader, writer)
+            return
         try:
             raw, line = await self._read_first_line(reader, 15)
         except Exception:
             self._close_writer(writer)
             return
+        if raw is None:
+            line = None
+        else:
+            line = (first + raw).decode("utf-8", "replace").rstrip("\r\n")
         if not line:
             self._close_writer(writer)
             return
@@ -144,8 +170,118 @@ class Relay:
             await self._control_flow(reader, writer, line)
         elif line.startswith("AUTH"):
             await self._data_flow(reader, writer, line)
+        elif line.startswith("AUTHX"):
+            await self._data_flow(reader, writer, line)
         else:
             await self._status_flow(writer)
+
+    async def _socks5_flow(self, reader, writer):
+        """SOCKS5 (RFC1928 + RFC1929 密码认证)。认证=token；仅放行私网目标。"""
+        peer = writer.get_extra_info("peername")
+        try:
+            # 握手（首字节 0x05 已由 handle_client 消费，这里从 NMETHODS 开始）
+            nmethods = (await asyncio.wait_for(reader.readexactly(1), 10))[0]
+            methods = await asyncio.wait_for(reader.readexactly(nmethods), 10)
+            if 2 not in methods:  # 要求用户名/密码认证
+                writer.write(b"\x05\xff")
+                await writer.drain()
+                self._close_writer(writer)
+                return
+            writer.write(b"\x05\x02")
+            await writer.drain()
+            # RFC1929 子协商
+            sub = await asyncio.wait_for(reader.readexactly(2), 10)
+            ulen = sub[1]
+            user = (await asyncio.wait_for(reader.readexactly(ulen), 10)).decode("utf-8", "replace")
+            plen = (await asyncio.wait_for(reader.readexactly(1), 10))[0]
+            password = (await asyncio.wait_for(reader.readexactly(plen), 10)).decode("utf-8", "replace")
+            if not self.token_ok(password):
+                writer.write(b"\x01\x01")
+                await writer.drain()
+                self._close_writer(writer)
+                log.warning("socks5 %s: auth failed (user=%r)", peer, user[:32])
+                return
+            writer.write(b"\x01\x00")
+            await writer.drain()
+            # CONNECT
+            hdr = await asyncio.wait_for(reader.readexactly(4), 10)
+            if hdr[1] != 1:  # 仅支持 CONNECT
+                writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                self._close_writer(writer)
+                return
+            atyp = hdr[3]
+            if atyp == 1:
+                raw_addr = await asyncio.wait_for(reader.readexactly(4), 10)
+                host = ".".join(str(b) for b in raw_addr)
+            elif atyp == 3:
+                dlen = (await asyncio.wait_for(reader.readexactly(1), 10))[0]
+                host = (await asyncio.wait_for(reader.readexactly(dlen), 10)).decode("utf-8", "replace")
+            else:
+                writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+                self._close_writer(writer)
+                return
+            praw = await asyncio.wait_for(reader.readexactly(2), 10)
+            port = (praw[0] << 8) | praw[1]
+
+            if not self._privnet_only(host):
+                log.info("socks5 %s: reject public target %s:%d", peer, host, port)
+                writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                self._close_writer(writer)
+                return
+
+            if self.ctrl_writer is None:
+                writer.write(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                self._close_writer(writer)
+                return
+
+            cid = self.next_cid + 1000000  # 动态连接独立编号空间
+            fut = asyncio.get_event_loop().create_future()
+            self.pending[(-1, cid)] = fut
+            self.ctrl_writer.write(("OPENX %d %s %d\n" % (cid, host, port)).encode())
+            await self.ctrl_writer.drain()
+            try:
+                br, bw = await asyncio.wait_for(fut, 15)
+            except Exception:
+                self.pending.pop((-1, cid), None)
+                writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                self._close_writer(writer)
+                return
+
+            # 成功
+            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+            self.stats["tunnel_ok"] += 1
+            log.info("socks5 %s -> %s:%d", peer, host, port)
+
+            async def pump(src, dst, stat_key):
+                try:
+                    while True:
+                        data = await asyncio.wait_for(src.read(8192), 600)
+                        if not data:
+                            break
+                        dst.write(data)
+                        self.stats[stat_key] += len(data)
+                        await dst.drain()
+                except Exception:
+                    pass
+                finally:
+                    self._try_write_eof(dst)
+
+            await asyncio.gather(
+                pump(br, writer, "bytes_board_to_visitor"),
+                pump(reader, bw, "bytes_visitor_to_board"),
+            )
+            self._close_writer(writer)
+            self._close_writer(bw)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+        except Exception as e:
+            log.debug("socks5 %s ended: %s", peer, e)
+        finally:
+            self._close_writer(writer)
 
     async def _status_flow(self, writer):
         """7000 端口收到非协议流量（v2 模式下访客请走映射端口）。"""
@@ -250,8 +386,10 @@ class Relay:
     async def _data_flow(self, reader, writer, line):
         peer = writer.get_extra_info("peername")
         parts = line.split()
-        # v2: AUTH token tid cid / v1: AUTH token cid
-        if len(parts) == 4:
+        # v3: AUTHX token cid | v2: AUTH token tid cid | v1: AUTH token cid
+        if parts[0] == "AUTHX" and len(parts) == 5:
+            tid, cid_s = "-1", parts[2]  # AUTHX token cid host port（目标由板子连）
+        elif len(parts) == 4:
             tid, cid_s = parts[2], parts[3]
         elif len(parts) == 3:
             tid, cid_s = "0", parts[2]
