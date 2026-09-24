@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.8"
+#define TUNNEL_FW_VERSION "v3.9"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -211,9 +211,14 @@ typedef struct {
 } gpio_entry_t;
 static gpio_entry_t s_gpios[CFG_MAX_GPIOS];
 
+static uint8_t s_led_manual = 0; /* 1=手动灯效：状态灯任务停刷，12/14/15 解锁给用户 */
+
 static int gpio_pin_reserved(uint8_t pin)
 {
-    return pin == 12 || pin == 14 || pin == 15; /* 板载三色状态灯 */
+    if (s_led_manual) {
+        return 0; /* 手动模式下状态灯引脚可自由配置 */
+    }
+    return pin == 12 || pin == 14 || pin == 15; /* 状态模式下板载三色灯保留 */
 }
 
 static void gpio_apply(gpio_entry_t *g)
@@ -616,7 +621,11 @@ static void mgmt_page(int fd)
         "<option value='in'>输入</option></select></td>"
         "<td>-</td><td><button name='op' value='gpio_add'>添加</button></td></tr></form>"
         "%s"
-        "</table>(pin12/14/15为状态灯,不可用)"
+        "</table>(状态模式下 pin12/14/15 保留给状态灯)"
+        "<form method='POST' action='/op'>"
+        "<input type='hidden' name='pw' value='%s'>"
+        "<button name='op' value='ledmode'>灯效模式切换(状态灯⇄手动)</button></form>"
+        "(手动模式解锁红绿蓝三脚可自由点灯/混色,重启回状态模式)"
         "<hr/><h3>SOCKS5</h3>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -645,6 +654,7 @@ static void mgmt_page(int fd)
         s_relay_host, (unsigned)s_relay_port, /* relay 表单 host/port 值 */
         s_pin,                             /* gpio 添加表单 pw */
         gpio_rows,                         /* gpio 表格行 */
+        s_pin,                             /* 灯效切换按钮 pw */
         s_pin, socks_op, socks_label,       /* socks 开关表单 */
         s_pin,                              /* socks 密码表单 pw */
         s_socks_pass[0] ? s_socks_pass : "(未设置)", /* 当前密码提示 */
@@ -859,6 +869,30 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strcmp(op, "ledmode") == 0) {
+        s_led_manual ^= 1;
+        if (!s_led_manual) {
+            /* 切回状态模式：清掉用户对 12/14/15 的 GPIO 配置，避免和状态灯打架 */
+            for (int i = 0; i < CFG_MAX_GPIOS; i++) {
+                if (s_gpios[i].in_use &&
+                    (s_gpios[i].pin == 12 || s_gpios[i].pin == 14 || s_gpios[i].pin == 15)) {
+                    s_gpios[i].in_use = 0;
+                }
+            }
+            map_save();
+        }
+        const char msg_on[] = "<html><body><h3>已切到手动灯效</h3>"
+            "<p>状态灯任务已停止，红(12)绿(14)蓝(15)三脚解锁——"
+            "现在去 GPIO 区添加它们，用按钮或 /gpio 接口随意点灯混色。</p></body></html>";
+        const char msg_off[] = "<html><body><h3>已切回状态灯模式</h3>"
+            "<p>红绿蓝恢复为状态指示（对这三个脚的 GPIO 配置已自动清除）。</p></body></html>";
+        if (s_led_manual) {
+            http_respond(fd, 200, "OK", msg_on, sizeof(msg_on) - 1);
+        } else {
+            http_respond(fd, 200, "OK", msg_off, sizeof(msg_off) - 1);
+        }
+        return 0;
+    }
     if (strcmp(op, "gpio_add") == 0) {
         char gpin[8], gdir[8];
         if (form_value(body, "gpin", gpin, sizeof(gpin)) > 0 &&
@@ -1151,6 +1185,10 @@ static void led_task(void *arg)
     bflb_gpio_init(s_led_gpio, LED_B, GPIO_OUTPUT | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_0);
     int phase = 0;
     for (;;) {
+        if (s_led_manual) {
+            vTaskDelay(500 / portTICK_PERIOD_MS); /* 手动灯效：不碰引脚 */
+            continue;
+        }
         int r_on = 0, g_on = 0, b_on = 0;
         if (s_ap_mode) {                       /* 配网热点：红闪 */
             r_on = phase;
