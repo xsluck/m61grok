@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v4.3"
+#define TUNNEL_FW_VERSION "v4.4"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -975,8 +975,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
-    http_respond(fd, 404, "Not Found", "hw module disabled", 18);
-    return 0;
+    /* 未匹配的路径自然落到下方的管理页 GET（v4.3 曾在此错插 404 兜底拦截页面，已删） */
 #endif /* hw: apis */
 #if CFG_HW_MODULE
     if (strncmp(path, "/gpio", 5) == 0) {
