@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.1"
+#define TUNNEL_FW_VERSION "v3.2"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -214,8 +214,8 @@ static uint16_t s_relay_port;
 static char s_token[65];
 static char s_pin[24];
 
-/* SOCKS5 开关（管理页控制，经 HELLO 下发给中继；默认开） */
-static uint8_t s_socks_on = 1;
+/* SOCKS5 开关（管理页控制，经 HELLO 下发给中继；默认关，手动开启） */
+static uint8_t s_socks_on = 0;
 
 /* 管理页 HTTP 处理串行锁：static 缓冲不允许并发（多访客同时打开会互相踩） */
 static SemaphoreHandle_t s_mgmt_lock;
@@ -227,7 +227,7 @@ void tunnel_wifi_connect(void);
 void tunnel_print_info(void);
 
 typedef struct {
-    char magic[4];                /* "M61X"（v3.1：+socks开关；旧布局读不过会回默认一次） */
+    char magic[4];                /* "M61Y"（v3.2：socks默认关；旧布局读不过会回默认一次） */
     uint16_t count;
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -260,7 +260,7 @@ static void map_defaults(void)
     s_relay_port = CFG_RELAY_CTRL_PORT;
     strncpy(s_token, CFG_TOKEN, sizeof(s_token) - 1);
     strncpy(s_pin, CFG_MGMT_PIN, sizeof(s_pin) - 1);
-    s_socks_on = 1;
+    s_socks_on = 0;
     const tunnel_map_t def[] = { CFG_DEFAULT_MAP };
     int n = sizeof(def) / sizeof(def[0]);
     if (n > CFG_MAX_TARGETS) {
@@ -276,7 +276,7 @@ static void map_load(void)
 {
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
-    if (memcmp(blob.magic, "M61X", 4) == 0 &&
+    if (memcmp(blob.magic, "M61Y", 4) == 0 &&
         blob.count > 0 && blob.count <= CFG_MAX_TARGETS &&
         blob.crc == blob_sum(&blob)) {
         memset(s_map, 0, sizeof(s_map));
@@ -313,7 +313,7 @@ int map_save(void)
 {
     static cfg_blob_t blob;
     memset(&blob, 0, sizeof(blob));
-    memcpy(blob.magic, "M61X", 4);
+    memcpy(blob.magic, "M61Y", 4);
     strncpy(blob.wifi_ssid, s_wifi_ssid, sizeof(blob.wifi_ssid) - 1);
     strncpy(blob.wifi_pass, s_wifi_pass, sizeof(blob.wifi_pass) - 1);
     strncpy(blob.relay_host, s_relay_host, sizeof(blob.relay_host) - 1);
