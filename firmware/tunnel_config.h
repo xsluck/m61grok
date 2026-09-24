@@ -23,6 +23,7 @@
 
 /* ---------- 多目标映射 ---------- */
 #define CFG_MAX_TARGETS    8
+#define CFG_MAX_GPIOS     8                /* 可配置的 GPIO 引脚数（管理页增删） */
 #define CFG_MGMT_PORT      80              /* 板载管理页（局域网 http://板子IP/ 或经映射端口访问） */
 #define CFG_CFG_FLASH_ADDR 0x3F3000        /* DATA 分区起始（bl616dk 4M 分区表，SDK 组件未占用） */
 

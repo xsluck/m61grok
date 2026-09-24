@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v3.6"
+#define TUNNEL_FW_VERSION "v3.7"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -202,6 +202,44 @@ typedef struct {
 
 static tunnel_map_t s_map[CFG_MAX_TARGETS];
 
+/* GPIO 配置（管理页增删，flash 持久化；12/14/15 是状态灯不可用） */
+typedef struct {
+    uint8_t pin;
+    uint8_t is_output;
+    uint8_t out_val;
+    uint8_t in_use;
+} gpio_entry_t;
+static gpio_entry_t s_gpios[CFG_MAX_GPIOS];
+
+static int gpio_pin_reserved(uint8_t pin)
+{
+    return pin == 12 || pin == 14 || pin == 15; /* 板载三色状态灯 */
+}
+
+static void gpio_apply(gpio_entry_t *g)
+{
+    struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
+    if (g->is_output) {
+        bflb_gpio_init(gpio, g->pin, GPIO_OUTPUT | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_0);
+        if (g->out_val) {
+            bflb_gpio_set(gpio, g->pin);
+        } else {
+            bflb_gpio_reset(gpio, g->pin);
+        }
+    } else {
+        bflb_gpio_init(gpio, g->pin, GPIO_INPUT | GPIO_PULLUP | GPIO_SMT_EN | GPIO_DRV_0);
+    }
+}
+
+static void gpio_apply_all(void)
+{
+    for (int i = 0; i < CFG_MAX_GPIOS; i++) {
+        if (s_gpios[i].in_use) {
+            gpio_apply(&s_gpios[i]);
+        }
+    }
+}
+
 /* WiFi 凭据也存 flash（管理页可改，换 WiFi 不用重烧固件） */
 static char s_wifi_ssid[33];
 static char s_wifi_pass[65];
@@ -235,7 +273,7 @@ void tunnel_wifi_connect(void);
 void tunnel_print_info(void);
 
 typedef struct {
-    char magic[4];                /* "M61Z"（v3.3：+socks独立密码；旧布局读不过会回默认一次） */
+    char magic[4];                /* "M62A"（v3.7：+GPIO表；旧布局读不过会回默认一次） */
     uint16_t count;
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -245,6 +283,7 @@ typedef struct {
     char pin[24];
     uint8_t socks_on;
     char socks_pass[33];
+    gpio_entry_t gpios[CFG_MAX_GPIOS];
     tunnel_map_t entries[CFG_MAX_TARGETS];
     uint32_t crc;                 /* 简单字节和校验 */
 } cfg_blob_t;
@@ -271,6 +310,7 @@ static void map_defaults(void)
     strncpy(s_pin, CFG_MGMT_PIN, sizeof(s_pin) - 1);
     s_socks_on = 0;
     s_socks_pass[0] = '\0';
+    memset(s_gpios, 0, sizeof(s_gpios));
     const tunnel_map_t def[] = { CFG_DEFAULT_MAP };
     int n = sizeof(def) / sizeof(def[0]);
     if (n > CFG_MAX_TARGETS) {
@@ -286,7 +326,7 @@ static void map_load(void)
 {
     static cfg_blob_t blob;
     bflb_flash_read(CFG_CFG_FLASH_ADDR, (uint8_t *)&blob, sizeof(blob));
-    if (memcmp(blob.magic, "M61Z", 4) == 0 &&
+    if (memcmp(blob.magic, "M62A", 4) == 0 &&
         blob.count > 0 && blob.count <= CFG_MAX_TARGETS &&
         blob.crc == blob_sum(&blob)) {
         memset(s_map, 0, sizeof(s_map));
@@ -308,6 +348,9 @@ static void map_load(void)
         s_socks_on = blob.socks_on ? 1 : 0;
         blob.socks_pass[sizeof(blob.socks_pass) - 1] = '\0';
         strncpy(s_socks_pass, blob.socks_pass, sizeof(s_socks_pass) - 1);
+        for (int i = 0; i < CFG_MAX_GPIOS; i++) {
+            s_gpios[i] = blob.gpios[i];
+        }
         for (int i = 0; i < blob.count && i < CFG_MAX_TARGETS; i++) {
             blob.entries[i].target_host[sizeof(blob.entries[i].target_host) - 1] = '\0';
             s_map[i] = blob.entries[i];
@@ -325,7 +368,7 @@ int map_save(void)
 {
     static cfg_blob_t blob;
     memset(&blob, 0, sizeof(blob));
-    memcpy(blob.magic, "M61Z", 4);
+    memcpy(blob.magic, "M62A", 4);
     strncpy(blob.wifi_ssid, s_wifi_ssid, sizeof(blob.wifi_ssid) - 1);
     strncpy(blob.wifi_pass, s_wifi_pass, sizeof(blob.wifi_pass) - 1);
     strncpy(blob.relay_host, s_relay_host, sizeof(blob.relay_host) - 1);
@@ -489,7 +532,7 @@ static int page_append(char *page, int off, int cap, const char *fmt, ...)
 
 static void mgmt_page(int fd)
 {
-    static char page[3072];
+    static char page[4096];
     char esc[64];
     int off = 0;
     int cap = (int)sizeof(page);
@@ -517,6 +560,36 @@ static void mgmt_page(int fd)
                           i, (unsigned)s_map[i].visitor_port, esc,
                           (unsigned)s_map[i].target_port, i);
     }
+    /* GPIO 行：独立拼接（输出脚显示当前电平并可切换；输入脚实时读） */
+    static char gpio_rows[1600];
+    struct bflb_device_s *gpio_dev = bflb_device_get_by_name("gpio");
+    int goff = 0;
+    gpio_rows[0] = '\0';
+    for (int i = 0; i < CFG_MAX_GPIOS && goff < (int)sizeof(gpio_rows) - 200; i++) {
+        if (!s_gpios[i].in_use) {
+            continue;
+        }
+        int lvl = 0;
+        if (s_gpios[i].is_output) {
+            lvl = s_gpios[i].out_val;
+        } else {
+            lvl = bflb_gpio_read(gpio_dev, s_gpios[i].pin) ? 1 : 0;
+        }
+        goff = page_append(gpio_rows, goff, (int)sizeof(gpio_rows),
+            "<tr><td>%d</td><td>%s</td><td>%d</td><td>"
+            "<form method='POST' action='/op'>"
+            "<input type='hidden' name='pw' value='%s'>"
+            "<input type='hidden' name='gidx' value='%d'>"
+            "<button name='op' value='gpio_tgl'>%s</button>"
+            "<button name='op' value='gpio_del'>删</button></form></td></tr>",
+            (int)s_gpios[i].pin,
+            s_gpios[i].is_output ? "OUT" : "IN",
+            lvl,
+            s_pin,
+            i,
+            s_gpios[i].is_output ? (lvl ? "拉低" : "拉高") : "-");
+    }
+
     const char *socks_op = s_socks_on ? "socks_off" : "socks_on";
     const char *socks_label = s_socks_on ? "SOCKS5: ON (click to disable)"
                                          : "SOCKS5: OFF (click to enable)";
@@ -543,6 +616,15 @@ static void mgmt_page(int fd)
         "<input name='rhost' size='18' placeholder='服务器IP' value='%s'> "
         "<input name='rport' size='6' placeholder='端口' value='%u'> "
         "<button name='op' value='relay'>切换到这个服务器</button></form>"
+        "<hr/><h3>GPIO</h3><table><tr><th>pin</th><th>dir</th><th>level</th><th>op</th></tr>"
+        "<form method='POST' action='/op'>"
+        "<input type='hidden' name='pw' value='%s'>"
+        "<tr><td><input name='gpin' size='3' placeholder='pin'></td>"
+        "<td><select name='gdir'><option value='out'>输出</option>"
+        "<option value='in'>输入</option></select></td>"
+        "<td>-</td><td><button name='op' value='gpio_add'>添加</button></td></tr></form>"
+        "%s"
+        "</table>(pin12/14/15为状态灯,不可用)"
         "<hr/><h3>SOCKS5</h3>"
         "<form method='POST' action='/op'>"
         "<input type='hidden' name='pw' value='%s'>"
@@ -569,6 +651,8 @@ static void mgmt_page(int fd)
         s_wifi_ssid,                        /* wifi ssid 输入框值 */
         s_pin,                              /* relay 表单的 pw */
         s_relay_host, (unsigned)s_relay_port, /* relay 表单 host/port 值 */
+        s_pin,                             /* gpio 添加表单 pw */
+        gpio_rows,                         /* gpio 表格行 */
         s_pin, socks_op, socks_label,       /* socks 开关表单 */
         s_pin,                              /* socks 密码表单 pw */
         s_socks_pass[0] ? s_socks_pass : "(未设置)", /* 当前密码提示 */
@@ -657,6 +741,33 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strncmp(path, "/gpio", 5) == 0) {
+        /* 脚本接口：GET /gpio?pw=x&pin=12&set=1  /  &get=1 → 文本返回 0/1 */
+        char vpin[8], vset[4], vget[4];
+        if (form_value(req_head, "pin", vpin, sizeof(vpin)) > 0) {
+            int pin = atoi(vpin);
+            struct bflb_device_s *gd = bflb_device_get_by_name("gpio");
+            for (int i = 0; i < CFG_MAX_GPIOS; i++) {
+                if (s_gpios[i].in_use && s_gpios[i].pin == pin) {
+                    if (form_value(req_head, "set", vset, sizeof(vset)) > 0) {
+                        if (s_gpios[i].is_output) {
+                            s_gpios[i].out_val = (uint8_t)atoi(vset);
+                            gpio_apply(&s_gpios[i]);
+                            map_save();
+                        }
+                    }
+                    int lvl = s_gpios[i].is_output ? s_gpios[i].out_val :
+                              (bflb_gpio_read(gd, s_gpios[i].pin) ? 1 : 0);
+                    http_respond(fd, 200, "OK", lvl ? "1" : "0", 1);
+                    return 0;
+                }
+            }
+            http_respond(fd, 404, "Not Found", "pin not configured", 18);
+            return 0;
+        }
+        http_respond(fd, 400, "Bad Request", "need pin", 8);
+        return 0;
+    }
     if (strcmp(method, "GET") == 0) {
         mgmt_page(fd);
         return 0;
@@ -756,6 +867,49 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
         return 0;
     }
 
+    if (strcmp(op, "gpio_add") == 0) {
+        char gpin[8], gdir[8];
+        if (form_value(body, "gpin", gpin, sizeof(gpin)) > 0 &&
+            form_value(body, "gdir", gdir, sizeof(gdir)) > 0) {
+            int pin = atoi(gpin);
+            if (pin < 0 || pin > 31 || gpio_pin_reserved((uint8_t)pin)) {
+                const char msg[] = "<html><body><h3>引脚不可用</h3>"
+                    "<p>范围 0-31，且 12/14/15 是状态灯保留。</p></body></html>";
+                http_respond(fd, 400, "Bad Request", msg, sizeof(msg) - 1);
+                return 0;
+            }
+            for (int i = 0; i < CFG_MAX_GPIOS; i++) {
+                if (!s_gpios[i].in_use) {
+                    memset(&s_gpios[i], 0, sizeof(s_gpios[i]));
+                    s_gpios[i].pin = (uint8_t)pin;
+                    s_gpios[i].is_output = (strcmp(gdir, "out") == 0);
+                    s_gpios[i].in_use = 1;
+                    gpio_apply(&s_gpios[i]);
+                    map_save();
+                    break;
+                }
+            }
+        }
+        mgmt_page(fd);
+        return 0;
+    }
+    if (strcmp(op, "gpio_del") == 0 || strcmp(op, "gpio_tgl") == 0) {
+        char gidx[8];
+        if (form_value(body, "gidx", gidx, sizeof(gidx)) > 0) {
+            int i = atoi(gidx);
+            if (i >= 0 && i < CFG_MAX_GPIOS && s_gpios[i].in_use) {
+                if (strcmp(op, "gpio_del") == 0) {
+                    s_gpios[i].in_use = 0;
+                } else if (s_gpios[i].is_output) {
+                    s_gpios[i].out_val ^= 1;
+                    gpio_apply(&s_gpios[i]);
+                }
+                map_save();
+            }
+        }
+        mgmt_page(fd);
+        return 0;
+    }
     if (strcmp(op, "socks_on") == 0 || strcmp(op, "socks_off") == 0) {
         if (strcmp(op, "socks_on") == 0 && s_socks_pass[0] == '\0') {
             const char msg[] = "<html><body><h3>请先设置SOCKS5密码</h3>"
@@ -1372,6 +1526,7 @@ void tunnel_init(void)
     }
     inited = 1;
     map_load();
+    gpio_apply_all();
     tunnel_print_info(); /* 开机自报家门 */
     s_mgmt_lock = xSemaphoreCreateMutex();
     xTaskCreate(ap_watchdog_task, "apwd", 512, NULL, 10, NULL);
