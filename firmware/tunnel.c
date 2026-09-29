@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v4.4"
+#define TUNNEL_FW_VERSION "v4.5"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -1664,10 +1664,10 @@ static void tunnel_data_task(void *arg)
                 break;
             }
             sock_set_rcvtimeo(s->local_fd, 100);
-            sock_set_sndtimeo(s->local_fd, 5000);
+            sock_set_sndtimeo(s->local_fd, 1000);
         }
         sock_set_rcvtimeo(s->relay_fd, 100);
-        sock_set_sndtimeo(s->relay_fd, 5000);
+        sock_set_sndtimeo(s->relay_fd, 1000); /* v4.5: 快速失败防堆积 */
         {
             int on = 1;
             setsockopt(s->relay_fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));

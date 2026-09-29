@@ -77,8 +77,8 @@
 #define MAC_RXQ_DEPTH                 CONFIG_MAC_RXQ_DEPTH
 
 #define TCP_MSS                       (1500 - 40)
-#define TCP_WND                       (2 * MAC_RXQ_DEPTH * TCP_MSS)
-#define TCP_SND_BUF                   (4 * MAC_TXQ_DEPTH * TCP_MSS)
+#define TCP_WND                       (6 * TCP_MSS)   /* v4.5: 收敛窗口(原2*RXQ*MSS≈93KB/连接→~9KB)，路由器大页面多并发不再耗尽 lwip 堆 */
+#define TCP_SND_BUF                   (8 * TCP_MSS)   /* v4.5: 同上收敛 */
 
 #define TCP_QUEUE_OOSEQ               1
 #define MEMP_NUM_TCP_SEG              ((4 * TCP_SND_BUF) / TCP_MSS)
