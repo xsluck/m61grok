@@ -60,6 +60,7 @@
 #define configTOTAL_HEAP_SIZE                   ((size_t)100 * 1024)
 #define configMAX_TASK_NAME_LEN                 (16)
 #define configUSE_TRACE_FACILITY                1
+#define INCLUDE_uxTaskGetStackHighWaterMark    1   /* v4.6: 栈水位诊断 */
 #define configUSE_STATS_FORMATTING_FUNCTIONS    1
 #define configUSE_16_BIT_TICKS                  0
 #define configIDLE_SHOULD_YIELD                 0

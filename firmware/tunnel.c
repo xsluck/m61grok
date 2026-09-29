@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define TUNNEL_FW_VERSION "v4.5"
+#define TUNNEL_FW_VERSION "v4.6"
 
 /* 配网热点 */
 #define CFG_AP_SSID "M61-Setup"
@@ -351,7 +351,7 @@ static SemaphoreHandle_t s_mgmt_lock;
 
 #if CFG_HW_MODULE
 /* ADC：模拟量读取（默认引脚 CFG_ADC_PIN=GPIO20/通道0；返回 mV） */
-static int adc_read_mv(void)
+static int adc_read_mv_raw(void)
 {
     struct bflb_device_s *gpio = bflb_device_get_by_name("gpio");
     struct bflb_device_s *adc = bflb_device_get_by_name("adc");
@@ -379,6 +379,22 @@ static int adc_read_mv(void)
     bflb_adc_parse_result(adc, &raw, &result, 1);
     /* millivolt (3.2V 满量程) */
     return result.millivolt;
+}
+
+static int adc_read_mv(void)
+{
+    /* v4.6: 8 次采样取中值（去抖抗尖刺） */
+    int v[8];
+    for (int i = 0; i < 8; i++) {
+        v[i] = adc_read_mv_raw();
+        vTaskDelay(2);
+    }
+    for (int i = 0; i < 7; i++) {
+        for (int j = i + 1; j < 8; j++) {
+            if (v[j] < v[i]) { int t = v[i]; v[i] = v[j]; v[j] = t; }
+        }
+    }
+    return v[3] + v[4]; /* 返回中间两值之和的均值，调用处显示 mV */
 }
 
 #endif /* hw: adc */
@@ -896,18 +912,41 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
     static char pw[80];
     char method[8] = "", path[96] = "";
 
-    /* 认证：URL ?pw= 或表单 pw= */
-    if (form_value(req_head, "pw", pw, sizeof(pw)) < 0 &&
-        form_value(body, "pw", pw, sizeof(pw)) < 0) {
-        pw[0] = '\0';
-    }
-    if (strcmp(pw, s_pin) != 0) {
-        static const char msg[] =
-            "<html><body><h3>403 密码错误</h3>"
-            "<p>URL 后加 ?pw=PIN（忘记请看串口 info 输出）</p></body></html>";
-        LOG_W("mgmt: auth failed from visitor");
-        http_respond(fd, 403, "Forbidden", msg, sizeof(msg) - 1);
-        return 0;
+    /* v4.6: 认证 + 失败锁定（连错 5 次锁 60 秒防爆破） */
+    static uint8_t s_fail_cnt = 0;
+    static uint32_t s_lock_until = 0;
+    {
+        char pwchk[80];
+        if (form_value(req_head, "pw", pwchk, sizeof(pwchk)) < 0 &&
+            form_value(body, "pw", pwchk, sizeof(pwchk)) < 0) {
+            pwchk[0] = '\0';
+        }
+        uint32_t now = now_ms();
+        if (s_lock_until && now < s_lock_until) {
+            static char lmsg[96];
+            int n = snprintf(lmsg, sizeof(lmsg), "locked, retry in %lus",
+                             (unsigned long)((s_lock_until - now) / 1000 + 1));
+            http_respond(fd, 423, "Locked", lmsg, n);
+            return 0;
+        }
+        if (s_lock_until && now >= s_lock_until) {
+            s_lock_until = 0;
+            s_fail_cnt = 0;
+        }
+        if (strcmp(pwchk, s_pin) != 0) {
+            if (++s_fail_cnt >= 5) {
+                s_lock_until = now + 60000;
+                s_fail_cnt = 0;
+                LOG_W("mgmt locked 60s (5 failed attempts)");
+            } else {
+                LOG_W("mgmt auth failed (%d/5)", s_fail_cnt);
+            }
+            static const char msg[] =
+                "<html><body><h3>403</h3><p>pw? (serial 'info' shows pin)</p></body></html>";
+            http_respond(fd, 403, "Forbidden", msg, sizeof(msg) - 1);
+            return 0;
+        }
+        s_fail_cnt = 0;
     }
 
     if (sscanf(req_head, "%7s %95s", method, path) != 2) {
@@ -960,7 +999,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
                     }
                     if (dirty) {
                         pwm_apply(&s_pwms[i]);
-                        map_save();
+                        /* v4.6: 运行态参数不写 flash */
                     }
                     static char buf[48];
                     int n = snprintf(buf, sizeof(buf), "%dHz %d/1000", s_pwms[i].freq, s_pwms[i].duty);
@@ -990,7 +1029,7 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
                         if (s_gpios[i].is_output) {
                             s_gpios[i].out_val = (uint8_t)atoi(vset);
                             gpio_apply(&s_gpios[i]);
-                            map_save();
+                            /* v4.6: 运行态电平不写 flash（防擦写磨损），重启恢复初始值 */
                         }
                     }
                     int lvl = s_gpios[i].is_output ? s_gpios[i].out_val :
@@ -1193,8 +1232,11 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
                 } else if (s_gpios[i].is_output) {
                     s_gpios[i].out_val ^= 1;
                     gpio_apply(&s_gpios[i]);
+                    /* v4.6: toggle 不写盘 */
                 }
-                map_save();
+                if (strcmp(op, "gpio_del") == 0) {
+                    map_save(); /* 仅结构变更（增删）写盘 */
+                }
             }
         }
         mgmt_page(fd);
@@ -1245,9 +1287,12 @@ static int mgmt_handle(int fd, const char *req_head, const char *body)
                     if (duty >= 0 && duty <= 1000) {
                         s_pwms[i].duty = (uint16_t)duty;
                         pwm_apply(&s_pwms[i]);
+                        /* v4.6: duty 调整不写盘 */
                     }
                 }
-                map_save();
+                if (strcmp(op, "pwm_del") == 0) {
+                    map_save(); /* 仅结构变更写盘 */
+                }
             }
         }
         mgmt_page(fd);
@@ -1777,6 +1822,24 @@ void tunnel_apply_now(void)
     }
 }
 
+static TaskHandle_t s_task_ctl, s_task_mgmt, s_task_spwm;
+
+static void diag_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(60000 / portTICK_PERIOD_MS);
+        LOG_I("diag: heap=%dB free", kfree_size());
+#if CFG_HW_MODULE
+        if (s_task_ctl) {
+            LOG_I("diag: stack left ctl=%dw mgmt=%dw",
+                  (int)uxTaskGetStackHighWaterMark(s_task_ctl),
+                  s_task_mgmt ? (int)uxTaskGetStackHighWaterMark(s_task_mgmt) : -1);
+        }
+#endif
+    }
+}
+
 static void tunnel_task(void *arg)
 {
     char line[384];
@@ -1919,11 +1982,11 @@ void tunnel_init(void)
     xTaskCreate(ap_watchdog_task, "apwd", 512, NULL, 10, NULL);
     xTaskCreate(led_task, "led", 512, NULL, 9, NULL);
 #if CFG_HW_MODULE
-    xTaskCreate(soft_pwm_task, "spwm", 512, NULL, 8, NULL);
+    xTaskCreate(soft_pwm_task, "spwm", 512, NULL, 8, &s_task_spwm);
 #endif
     /* 管理页开机即启动（监听所有接口）——不能等连上 WiFi 才起：
      * AP 配网模式恰恰是连不上 WiFi 的场景，管理页必须先于网络可用 */
-    xTaskCreate(mgmt_server_task, "mgmt", 1024, NULL, 11, NULL);
+    xTaskCreate(mgmt_server_task, "mgmt", 1024, NULL, 11, &s_task_mgmt);
 }
 
 void tunnel_start(void)
@@ -1933,5 +1996,6 @@ void tunnel_start(void)
         return;
     }
     s_tunnel_started = 1;
-    xTaskCreate(tunnel_task, "tunnelctl", 1024, NULL, 12, NULL);
+    xTaskCreate(tunnel_task, "tunnelctl", 1024, NULL, 12, &s_task_ctl);
+    xTaskCreate(diag_task, "diag", 512, NULL, 8, NULL);
 }
